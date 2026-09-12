@@ -1,3 +1,4 @@
+load("//test/benchmarks:defs.bzl", "benchmark_test")
 load("//tools:defs.bzl", "default_platform", "go_library", "go_test", "most_shards", "platforms")
 
 package(
@@ -191,4 +192,71 @@ go_test(
     size = "small",
     srcs = ["state_file_inventory_test.go"],
     embed = [":container"],
+)
+
+go_test(
+    name = "template_fork_e2e_test",
+    size = "large",
+    srcs = [
+        "container_testutil_test.go",
+        "template_fork_e2e_main_test.go",
+        "template_fork_e2e_test.go",
+    ],
+    data = [
+        "//:release",
+        "//test/cmd/fork_ready",
+    ],
+    embed = [":container"],
+    tags = [
+        "manual",
+        "requires-kvm",
+    ],
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/control/client",
+        "//pkg/log",
+        "//pkg/sentry/fsimpl/erofs",
+        "//pkg/test/testutil",
+        "//pkg/urpc",
+        "//runsc/boot/sentryapi",
+        "//runsc/config",
+        "//runsc/flag",
+        "//runsc/hostsettings",
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@com_github_vishvananda_netlink//:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+benchmark_test(
+    name = "template_fork_startup_benchmark_test",
+    srcs = [
+        "container_testutil_test.go",
+        "template_fork_e2e_test.go",
+        "template_fork_startup_benchmark_test.go",
+    ],
+    data = [
+        "//:release",
+        "//test/cmd/fork_ready",
+    ],
+    embed = [":container"],
+    tags = ["requires-kvm"],
+    use_for_pgo = False,
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/control/client",
+        "//pkg/log",
+        "//pkg/sentry/fsimpl/erofs",
+        "//pkg/test/testutil",
+        "//pkg/urpc",
+        "//runsc/boot/sentryapi",
+        "//runsc/config",
+        "//runsc/flag",
+        "//runsc/hostsettings",
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@com_github_vishvananda_netlink//:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
 )
