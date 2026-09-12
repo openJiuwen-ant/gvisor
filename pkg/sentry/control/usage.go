@@ -72,6 +72,10 @@ func (u *Usage) UsageFD(opts *MemoryUsageFileOpts, out *MemoryUsageFile) error {
 	}
 
 	mf := u.Kernel.MemoryFile()
+	if mf.IsPrivateAnonymous() {
+		return fmt.Errorf("usage FD is unavailable for anonymous memory; use Usage.Collect")
+	}
+
 	*out = MemoryUsageFile{
 		FilePayload: urpc.FilePayload{
 			Files: []*os.File{

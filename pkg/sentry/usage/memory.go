@@ -262,8 +262,23 @@ var (
 	initErr  error
 )
 
+// InitOpts controls how Init wires up the RT memory stats page.
+type InitOpts struct {
+	// If PrivateAnonymousMapping is true, the RT stats page is backed by
+	// a MAP_PRIVATE|MAP_ANON mapping rather than MAP_SHARED of the memfd.
+	// This is required for the sandbox-fork path: after runtime.Clone()
+	// the cloned child must observe its own private copy of the page
+	// rather than share it with the template.
+	PrivateAnonymousMapping bool
+}
+
 // Init initializes global 'MemoryAccounting'.
 func Init() error {
+	return InitWithOpts(InitOpts{})
+}
+
+// InitWithOpts initializes global 'MemoryAccounting' with opts.
+func InitWithOpts(opts InitOpts) error {
 	initOnce.Do(func() {
 		initErr = func() error {
 			const name = "memory-usage"
@@ -275,11 +290,16 @@ func Init() error {
 			if err := file.Truncate(int64(RTMemoryStatsSize)); err != nil {
 				return fmt.Errorf("error truncating usage file: %v", err)
 			}
+
+			flags := uintptr(unix.MAP_SHARED)
+			if opts.PrivateAnonymousMapping {
+				flags = unix.MAP_PRIVATE | unix.MAP_ANON
+			}
 			// Note: We rely on the returned page being initially zeroed. This will
 			// always be the case for a newly mapped page from /dev/shm. If we obtain
 			// the shared memory through some other means in the future, we may have to
 			// explicitly zero the page.
-			mmap, err := memutil.MapFile(0, RTMemoryStatsSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED, file.Fd(), 0)
+			mmap, err := memutil.MapFile(0, RTMemoryStatsSize, unix.PROT_READ|unix.PROT_WRITE, flags, file.Fd(), 0)
 			if err != nil {
 				return fmt.Errorf("error mapping usage file: %v", err)
 			}

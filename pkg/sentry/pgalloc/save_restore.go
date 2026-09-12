@@ -281,6 +281,9 @@ func (f *MemoryFile) ChunkCount() int {
 
 // SaveTo writes f's state to the given stream.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
+	if f.IsPrivateAnonymous() && opts.PagesFile != nil && opts.PagesFile.aw.NeedRegisterSourceFD() {
+		return fmt.Errorf("checkpoint page writer requires a backing file: %w", linuxerr.EOPNOTSUPP)
+	}
 	if err := f.AwaitLoadAll(); err != nil {
 		return fmt.Errorf("previous async page loading failed: %w", err)
 	}
@@ -1162,6 +1165,10 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		}
 	}()
 
+	if f.IsPrivateAnonymous() && opts.PagesFile != nil && opts.PagesFile.ar.NeedRegisterDestinationFD() {
+		return fmt.Errorf("checkpoint page reader requires a backing file: %w", linuxerr.EOPNOTSUPP)
+	}
+
 	// Load metadata.
 	timeMetadataStart := gohacks.Nanotime()
 	var lengthBuf [8]byte
@@ -1220,9 +1227,12 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			}
 		}
 	}
-	if err := f.file.Truncate(int64(fileSize)); err != nil {
-		return fmt.Errorf("failed to truncate MemoryFile: %w", err)
+	if !f.IsPrivateAnonymous() {
+		if err := f.file.Truncate(int64(fileSize)); err != nil {
+			return fmt.Errorf("failed to truncate MemoryFile: %w", err)
+		}
 	}
+
 	// Obtain chunk mappings, then madvise them concurrently with loading data.
 	var (
 		madviseEnd  atomicbitops.Uint64
@@ -1230,12 +1240,17 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		madviseWG   sync.WaitGroup
 	)
 	if len(chunks) != 0 {
+		mmapFlags := uintptr(unix.MAP_SHARED)
+		if f.IsPrivateAnonymous() {
+			mmapFlags = unix.MAP_PRIVATE | unix.MAP_ANON
+		}
+
 		m, _, errno := unix.Syscall6(
 			unix.SYS_MMAP,
 			0,
 			uintptr(fileSize),
 			unix.PROT_READ|unix.PROT_WRITE,
-			unix.MAP_SHARED,
+			mmapFlags,
 			f.file.Fd(),
 			0)
 		if errno != 0 {

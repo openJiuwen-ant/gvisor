@@ -159,6 +159,7 @@ go_library(
         "apfl_mutex.go",
         "apfs_mutex.go",
         "apl_unloaded_set.go",
+        "backing_file.go",
         "context.go",
         "debug.go",
         "evictable_range.go",
@@ -207,6 +208,8 @@ go_test(
     name = "pgalloc_test",
     size = "small",
     srcs = [
+        "backing_file_test.go",
+        "fork_save_restore_test.go",
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
         "save_restore_external_test.go",

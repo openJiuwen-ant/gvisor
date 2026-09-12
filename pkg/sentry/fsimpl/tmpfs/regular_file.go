@@ -429,8 +429,24 @@ func maxOptionalRange(required, optional memmap.MappableRange, maxBytes uint64) 
 	return optional
 }
 
+// invalidateUnsavable indicates whether disk-backed tmpfs regular files should
+// drop all mappings during InvalidateUnsavable.
+var invalidateUnsavable bool
+
+// SetInvalidateUnsavable toggles whether disk-backed tmpfs regular files should
+// drop all mappings during InvalidateUnsavable. Used when a fork-derived
+// sandbox needs to swap in a fresh backend file.
+func SetInvalidateUnsavable(invalidate bool) {
+	invalidateUnsavable = invalidate
+}
+
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
-func (*regularFile) InvalidateUnsavable(context.Context) error {
+func (rf *regularFile) InvalidateUnsavable(context.Context) error {
+	if rf.inode.fs.mf.IsDiskBacked() && invalidateUnsavable {
+		rf.mapsMu.Lock()
+		rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
+		rf.mapsMu.Unlock()
+	}
 	return nil
 }
 
