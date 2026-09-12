@@ -16,6 +16,7 @@ package kvm
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	gosync "sync"
 	"sync/atomic"
@@ -40,6 +41,10 @@ import (
 type machine struct {
 	// fd is the vm fd.
 	fd int
+
+	// procfs is retained by Drop so Reload can open the child's maps after
+	// /proc is unmounted. It is closed when maps is opened, or by Destroy.
+	procfs *os.File
 
 	// machinePoolIndex is the index in the machinePool array.
 	machinePoolIndex uint32
@@ -252,19 +257,19 @@ func (m *machine) createVCPU(id int) (*vCPU, error) {
 
 	// Ensure the signal mask is correct.
 	if err := c.setSignalMask(); err != nil {
-		panic(fmt.Sprintf("error setting signal mask for vCPU(id=%d): %v", id, err))
+		return nil, fmt.Errorf("error setting signal mask for vCPU(id=%d): %w", id, err)
 	}
 
 	// Map the run data.
 	runData, err := mapRunData(int(fd))
 	if err != nil {
-		panic(fmt.Sprintf("error mapping run data for vCPU(id=%d): %v", id, err))
+		return nil, fmt.Errorf("error mapping run data for vCPU(id=%d): %w", id, err)
 	}
 	c.runData = runData
 
 	// Initialize architecture state.
 	if err := c.initArchState(); err != nil {
-		panic(fmt.Sprintf("error initializing vCPU(id=%d) state: %v", id, err))
+		return nil, fmt.Errorf("error initializing vCPU(id=%d) state: %w", id, err)
 	}
 
 	return c, nil // Done.
@@ -327,19 +332,38 @@ func newMachine(vm int, config *Config) (*machine, error) {
 	})
 	config.StartupTimer.Reached("kvm physical regions mapped")
 
-	m.mapCurrentMappings(mapEntireAddressSpace)
+	if err := m.mapCurrentMappings(mapEntireAddressSpace, true); err != nil {
+		m.Destroy()
+		return nil, err
+	}
 	config.StartupTimer.Reached("kvm virtual regions mapped")
-
 	// Initialize architecture state.
 	if err := m.initArchState(); err != nil {
 		m.Destroy()
 		return nil, err
 	}
+
 	config.StartupTimer.Reached("kvm arch state initialized")
 
 	// Ensure the machine is cleaned up properly.
 	runtime.SetFinalizer(m, (*machine).Destroy)
 	return m, nil
+}
+
+// reload binds m to vm after the previous VM fd has been dropped.
+func (m *machine) reload(vm int) error {
+	m.fd = vm
+	m.initVCPUTables()
+	m.initMemslots()
+	m.initTSCControl()
+	mapEntireAddressSpace := shouldMapEntireAddressSpace()
+	if !mapEntireAddressSpace {
+		m.registerInMachinePool()
+	}
+	if err := m.mapCurrentMappings(mapEntireAddressSpace, false); err != nil {
+		return err
+	}
+	return m.initArchState()
 }
 
 // initVCPUTables initializes vCPU lookup tables based on the VM's vCPU limit.
@@ -389,7 +413,26 @@ func shouldMapEntireAddressSpace() bool {
 	return forceMappingEntireAddressSpace || mapEntireAddressSpaceDefault
 }
 
-func (m *machine) mapCurrentMappings(mapEntireAddressSpace bool) {
+// mapCurrentMappings installs memslots for sentry mappings that already exist.
+func (m *machine) mapCurrentMappings(mapEntireAddressSpace bool, mapExecutable bool) error {
+	var maps *os.File
+	if m.procfs != nil {
+		mapsFD, err := unix.Openat(int(m.procfs.Fd()), "self/maps", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+		m.procfs.Close()
+		m.procfs = nil
+		if err != nil {
+			return fmt.Errorf("opening process maps for KVM reload: %w", err)
+		}
+		maps = os.NewFile(uintptr(mapsFD), "process maps")
+	} else {
+		var err error
+		maps, err = os.Open("/proc/self/maps")
+		if err != nil {
+			return fmt.Errorf("opening process maps for KVM: %w", err)
+		}
+	}
+	defer maps.Close()
+
 	// Ensure that the currently mapped virtual regions are actually
 	// available in the VM. Note that this doesn't guarantee no future
 	// faults, however it should guarantee that everything is available to
@@ -407,7 +450,7 @@ func (m *machine) mapCurrentMappings(mapEntireAddressSpace bool) {
 				length = vr.virtual + vr.length - virtual
 			}
 			// Update page tables for executable mappings.
-			if vr.accessType.Execute {
+			if mapExecutable && vr.accessType.Execute {
 				if vr.accessType.Write {
 					panic(fmt.Sprintf("executable mapping can't be writable: %#v", vr))
 				}
@@ -428,8 +471,9 @@ func (m *machine) mapCurrentMappings(mapEntireAddressSpace bool) {
 	// seccompMmapHandler, so here we have to guarantee that mmap is not
 	// called while we hold the slot spinlock.
 	disableAsyncPreemption()
+	defer enableAsyncPreemption()
 
-	applyVirtualRegions(func(vr virtualRegion) bool {
+	err := parseVirtualRegions(maps, func(vr virtualRegion) bool {
 		if excludeVirtualRegion(vr) {
 			return false // skip region.
 		}
@@ -442,12 +486,15 @@ func (m *machine) mapCurrentMappings(mapEntireAddressSpace bool) {
 		mapRegion(vr)
 		return false
 	})
+	if err != nil {
+		return fmt.Errorf("reading process maps for KVM: %w", err)
+	}
 	if mapEntireAddressSpace {
 		for _, r := range physicalRegions {
 			m.mapPhysical(r.physical, r.length)
 		}
 	}
-	enableAsyncPreemption()
+	return nil
 }
 
 // hasSlot returns true if the given address is mapped.
@@ -496,6 +543,20 @@ func (m *machine) mapPhysical(physical, length uintptr) {
 	}
 }
 
+// drop tears down KVM-resident state while preserving process-resident state
+// needed to reload the machine against a fresh VM fd. This must preserve
+// m.kernel.PageTables: executable mappings are installed during initial
+// machine creation and reused after reload.
+func (m *machine) drop() {
+	m.destroyVM()
+	m.fd = -1
+	m.vCPUsByTID = nil
+	m.vCPUsByID = nil
+	m.usedVCPUs = 0
+	m.usedSlots = nil
+	m.nextSlot.Store(0)
+}
+
 // destroyVCPUs closes all vCPU fds and unmaps their KVM_RUN pages.
 func (m *machine) destroyVCPUs() {
 	for _, c := range m.vCPUsByID {
@@ -521,6 +582,25 @@ func (m *machine) destroyVCPUs() {
 	}
 }
 
+// destroyVM tears down the current VM fd and state owned by it. It must not
+// release process-resident page tables; the reloadable drop path reuses them.
+func (m *machine) destroyVM() {
+	if m.fd < 0 {
+		return
+	}
+	m.destroyVCPUs()
+
+	if machinePool[m.machinePoolIndex].Load() == m {
+		machinePool[m.machinePoolIndex].Store(nil)
+		seccompMmapSync()
+	}
+
+	// vCPUs are gone: teardown machine state.
+	if err := unix.Close(m.fd); err != nil {
+		panic(fmt.Sprintf("error closing VM fd: %v", err))
+	}
+}
+
 // Destroy frees associated resources.
 //
 // Destroy should only be called once all active users of the machine are gone.
@@ -529,16 +609,11 @@ func (m *machine) destroyVCPUs() {
 // Precondition: all vCPUs must be returned to the machine.
 func (m *machine) Destroy() {
 	runtime.SetFinalizer(m, nil)
-
-	m.destroyVCPUs()
-
-	machinePool[m.machinePoolIndex].Store(nil)
-	seccompMmapSync()
-
-	// vCPUs are gone: teardown machine state.
-	if err := unix.Close(m.fd); err != nil {
-		panic(fmt.Sprintf("error closing VM fd: %v", err))
+	if m.procfs != nil {
+		m.procfs.Close()
+		m.procfs = nil
 	}
+	m.drop()
 }
 
 // Get gets an available vCPU.
@@ -910,6 +985,8 @@ func seccompMmapRules(m *machine) {
 	m.registerInMachinePool()
 }
 
+// registerInMachinePool reserves a machinePool slot for m. A dropped machine
+// can be registered again when it is reloaded.
 func (m *machine) registerInMachinePool() {
 	machinePoolMu.Lock()
 	n := machinePoolLen.Load()

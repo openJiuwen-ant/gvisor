@@ -57,7 +57,7 @@ func OpenDevice(devicePath string) (*fd.FD, error) {
 	if devicePath == "" {
 		devicePath = "/dev/slimvm"
 	}
-	f, err := fd.Open(devicePath, syscall.O_RDWR, 0)
+	f, err := fd.Open(devicePath, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("error opening %s: %v", devicePath, err)
 	}
@@ -161,6 +161,35 @@ func (k *SlimVM) HealthCheck() {
 	k.machine.mu.RLock()
 	_ = struct{}{}
 	k.machine.mu.RUnlock()
+}
+
+// Drop implements platform.Platform.Drop.
+func (k *SlimVM) Drop() {
+	k.machine.drop()
+}
+
+// Reload implements platform.Platform.Reload.
+func (k *SlimVM) Reload(devFile *fd.FD) error {
+	if devFile == nil {
+		return fmt.Errorf("SlimVM reload requires a device fd")
+	}
+	if slimvmFile != nil {
+		devFile.Close()
+		return fmt.Errorf("SlimVM reload requires a dropped VM")
+	}
+	slimvmFile = devFile
+	slimvmFD = uintptr(devFile.FD())
+	if err := k.machine.initArchState(); err != nil {
+		k.machine.drop()
+		return fmt.Errorf("initializing SlimVM after reload: %w", err)
+	}
+	return nil
+}
+
+// SetSandboxID updates the ID passed to the SlimVM kernel module when creating
+// vCPUs.
+func (k *SlimVM) SetSandboxID(sandboxID string) {
+	k.machine.sandboxID = parseSandboxID(sandboxID)
 }
 
 type constructor struct{}

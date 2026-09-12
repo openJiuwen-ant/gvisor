@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/eventfd"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
@@ -43,16 +44,31 @@ type testHarness interface {
 	Fatalf(format string, args ...any)
 }
 
+func openTestDevice(t testHarness, path string) *fd.FD {
+	dev, err := OpenDevice(path)
+	if err != nil {
+		t.Fatalf("opening KVM test device %q: %v", path, err)
+	}
+	return dev
+}
+
+func newTestKVM(t testHarness, config Config) *KVM {
+	k, err := New(openTestDevice(t, ""), config)
+	if err != nil {
+		t.Fatalf("creating KVM: %v", err)
+	}
+	return k
+}
+
+// kvmTest is kvmTestWithConfig with the default Config.
 func kvmTest(t testHarness, setup func(*KVM), fn func(*vCPU) bool) {
-	// Create the machine.
-	deviceFile, err := OpenDevice("")
-	if err != nil {
-		t.Fatalf("error opening device file: %v", err)
-	}
-	k, err := New(deviceFile, Config{})
-	if err != nil {
-		t.Fatalf("error creating KVM instance: %v", err)
-	}
+	kvmTestWithConfig(t, Config{}, setup, fn)
+}
+
+// kvmTestWithConfig creates a KVM instance with config, calls setup on it if
+// non-nil, and then calls fn with a vCPU until fn returns false.
+func kvmTestWithConfig(t testHarness, config Config, setup func(*KVM), fn func(*vCPU) bool) {
+	k := newTestKVM(t, config)
 	defer k.machine.Destroy()
 
 	// Call additional setup.
@@ -86,6 +102,92 @@ func bluepillTest(t testHarness, fn func(*vCPU)) {
 		fn(c)
 		return false
 	})
+}
+
+func TestDropReload(t *testing.T) {
+	t.Run("unshifted", func(t *testing.T) { testDropReload(t, 0) })
+	t.Run("shifted", func(t *testing.T) { testDropReload(t, 1<<40) })
+}
+
+func testDropReload(t *testing.T, offset uint64) {
+	k := newTestKVM(t, Config{TSCOffset: offset})
+	defer k.machine.Destroy()
+	as, err := k.NewAddressSpace(platform.AddressSpaceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt := as.(*addressSpace).pageTables
+	mapTestPhysicalRegions(pt)
+
+	c := k.machine.Get()
+	k.machine.Put(c)
+	vmFD := k.machine.fd
+	k.Drop()
+	if _, err := unix.FcntlInt(uintptr(vmFD), unix.F_GETFD, 0); err != unix.EBADF {
+		t.Fatalf("VM fd after Drop: got %v, want EBADF", err)
+	}
+	k.Drop() // Drop must also tolerate an already dropped VM.
+	if err := k.Reload(openTestDevice(t, "")); err != nil {
+		t.Fatal(err)
+	}
+	defer as.Release()
+	if k.machine.procfs != nil {
+		t.Fatal("Reload retained the procfs directory")
+	}
+
+	// Run a guest syscall using the address space created before Drop.
+	var regs arch.Registers
+	testutil.SetTestTarget(&regs, testutil.AddrOfSyscallLoop())
+	c = k.machine.Get()
+	defer func() {
+		redpill()
+		k.machine.Put(c)
+	}()
+	for {
+		var si linux.SignalInfo
+		_, err := c.SwitchToUser(ring0.SwitchOpts{
+			Registers:          &regs,
+			FloatingPointState: &dummyFPState,
+			PageTables:         pt,
+			FullRestore:        true,
+		}, &si)
+		if err == platform.ErrContextInterrupt {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+}
+
+func TestReloadFailure(t *testing.T) {
+	k := newTestKVM(t, Config{})
+	defer k.machine.Destroy()
+	k.Drop()
+
+	dev := openTestDevice(t, "/dev/null")
+	devFD := dev.FD()
+	if err := k.Reload(dev); err == nil {
+		t.Fatal("Reload accepted an invalid device")
+	}
+	if _, err := unix.FcntlInt(uintptr(devFD), unix.F_GETFD, 0); err != unix.EBADF {
+		t.Fatalf("device fd after failed Reload: got %v, want EBADF", err)
+	}
+
+	// Fail after VM creation by supplying a directory without self/maps.
+	dir, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	k.machine.procfs.Close()
+	k.machine.procfs = dir
+	if err := k.Reload(openTestDevice(t, "")); err == nil {
+		t.Fatal("Reload succeeded without process maps")
+	}
+	if k.machine.fd >= 0 || k.machine.procfs != nil {
+		t.Fatal("failed Reload retained the VM or procfs directory")
+	}
 }
 
 func TestKernelSyscall(t *testing.T) {
@@ -123,6 +225,21 @@ func TestKernelFloatingPoint(t *testing.T) {
 	})
 }
 
+func mapTestPhysicalRegions(pt *pagetables.PageTables) {
+	// Apply the physical mappings to these page tables.
+	// (This is normally dangerous, since they point to
+	// physical pages that may not exist. This shouldn't be
+	// done for regular user code, but is fine for test
+	// purposes.)
+	applyPhysicalRegions(func(pr physicalRegion) bool {
+		pt.Map(hostarch.Addr(pr.virtual), pr.length, pagetables.MapOpts{
+			AccessType: hostarch.AnyAccess,
+			User:       true,
+		}, pr.physical)
+		return true // Keep iterating.
+	})
+}
+
 func applicationTest(t testHarness, useHostMappings bool, targetFn uintptr, fn func(*vCPU, *arch.Registers, *pagetables.PageTables) bool) {
 	// Initialize registers & page tables.
 	var (
@@ -140,18 +257,7 @@ func applicationTest(t testHarness, useHostMappings bool, targetFn uintptr, fn f
 		pt = as.(*addressSpace).pageTables
 
 		if useHostMappings {
-			// Apply the physical mappings to these page tables.
-			// (This is normally dangerous, since they point to
-			// physical pages that may not exist. This shouldn't be
-			// done for regular user code, but is fine for test
-			// purposes.)
-			applyPhysicalRegions(func(pr physicalRegion) bool {
-				pt.Map(hostarch.Addr(pr.virtual), pr.length, pagetables.MapOpts{
-					AccessType: hostarch.AnyAccess,
-					User:       true,
-				}, pr.physical)
-				return true // Keep iterating.
-			})
+			mapTestPhysicalRegions(pt)
 		}
 	}, func(c *vCPU) bool {
 		// Invoke the function with the extra data.
@@ -631,4 +737,19 @@ func TestMain(m *testing.M) {
 	cpuid.Initialize()
 	dummyFPState = fpu.NewState()
 	os.Exit(m.Run())
+}
+
+func TestOpenDeviceCloseOnExec(t *testing.T) {
+	device, err := OpenDevice("/dev/null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer device.Close()
+	flags, err := unix.FcntlInt(uintptr(device.FD()), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flags&unix.FD_CLOEXEC == 0 {
+		t.Fatal("platform device may be inherited by an unrelated exec")
+	}
 }

@@ -289,6 +289,16 @@ func (*PTrace) MapUnit() uint64 {
 	return 0
 }
 
+// Drop implements platform.Platform.Drop.
+func (*PTrace) Drop() {
+	panic("ptrace platform does not support Drop/Reload")
+}
+
+// Reload implements platform.Platform.Reload.
+func (*PTrace) Reload(_ *fd.FD) error {
+	panic("ptrace platform does not support Drop/Reload")
+}
+
 // MaxUserAddress returns the first address that may not be used by user
 // applications.
 func (*PTrace) MaxUserAddress() hostarch.Addr {
