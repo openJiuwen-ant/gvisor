@@ -47,6 +47,10 @@ type LoadOpts struct {
 	// a sandbox. This is used when looking for a sandbox given that root
 	// container and sandbox share the same ID.
 	RootContainer bool
+
+	// AllowTemplate permits loading a sandbox template through the generic
+	// Container state loader. Template lifecycle APIs set this explicitly.
+	AllowTemplate bool
 }
 
 // Load loads a container with the given id from a metadata file. "id" may
@@ -86,6 +90,9 @@ func Load(rootDir string, id FullID, opts LoadOpts) (*Container, error) {
 		return nil, fmt.Errorf("reading container metadata file %q: %w", state.statePath(), err)
 	}
 	c.Sandbox.SetRootDir(rootDir)
+	if c.Sandbox.Template && !opts.AllowTemplate {
+		return nil, fmt.Errorf("container %q is a sandbox template", c.ID)
+	}
 
 	if opts.RootContainer && c.ID != c.Sandbox.ID {
 		return nil, fmt.Errorf("ID %q doesn't belong to a sandbox", id)
@@ -110,7 +117,37 @@ func Load(rootDir string, id FullID, opts LoadOpts) (*Container, error) {
 // List returns all container ids in the given root directory.
 func List(rootDir string) ([]FullID, error) {
 	log.Debugf("List containers %q", rootDir)
-	return listMatch(rootDir, FullID{})
+	ids, err := listMatch(rootDir, FullID{})
+	if err != nil {
+		return nil, err
+	}
+	containers := ids[:0]
+	for _, id := range ids {
+		template, err := isTemplateState(rootDir, id)
+		if template || os.IsNotExist(err) {
+			continue
+		}
+		containers = append(containers, id)
+	}
+	return containers, nil
+}
+
+// isTemplateState reads only the template discriminator without taking the
+// state lock, so a list never waits for a container operation.
+func isTemplateState(rootDir string, id FullID) (bool, error) {
+	if id.ContainerID != id.SandboxID {
+		return false, nil
+	}
+	var state struct {
+		Sandbox struct{ Template bool }
+	}
+	f, err := os.Open(buildPath(rootDir, id, stateFileExtension))
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	err = json.NewDecoder(f).Decode(&state)
+	return state.Sandbox.Template, err
 }
 
 // ListSandboxes returns all sandbox ids in the given root directory.

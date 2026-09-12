@@ -384,6 +384,42 @@ type Cgroup interface {
 	MakePath(controllerName string) string
 }
 
+// MovePid moves pid into cg. It is intended for processes that are already
+// running and therefore cannot inherit cg by being spawned from a joined
+// parent process.
+func MovePid(cg Cgroup, pid int) error {
+	if cg == nil {
+		return nil
+	}
+	if pid <= 0 {
+		return fmt.Errorf("invalid pid %d", pid)
+	}
+	pidStr := strconv.Itoa(pid)
+
+	switch c := cg.(type) {
+	case *cgroupV1:
+		for key, ctrlr := range controllers {
+			path := c.MakePath(key)
+			log.Debugf("Moving pid %d to cgroup %q", pid, path)
+			if err := setValue(path, "cgroup.procs", pidStr); err != nil {
+				if ctrlr.optional() && os.IsNotExist(err) {
+					continue
+				}
+				return err
+			}
+		}
+		return nil
+	case *cgroupSystemd:
+		return fmt.Errorf("moving pid into systemd cgroup is not supported")
+	case *cgroupV2:
+		path := c.MakePath("")
+		log.Debugf("Moving pid %d to cgroup %q", pid, path)
+		return setValue(path, "cgroup.procs", pidStr)
+	default:
+		return fmt.Errorf("unsupported cgroup type %T", cg)
+	}
+}
+
 // cgroupV1 represents a group inside all controllers. For example:
 //
 //	Name='/foo/bar' maps to /sys/fs/cgroup/<controller>/foo/bar on

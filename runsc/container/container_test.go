@@ -4736,28 +4736,6 @@ func TestExecFDExec(t *testing.T) {
 	}
 }
 
-// skipIfNotAvailable skips the test if the requested executable files are not available.
-func skipIfNotAvailable(t *testing.T, files ...string) {
-	for _, f := range files {
-		if _, err := exec.LookPath(f); err != nil {
-			t.Skipf("%v is not available: %v", f, err)
-		}
-	}
-}
-
-// createImageEROFS creates the EROFS image from the source directory using the requested options.
-func createImageEROFS(image, source string, options ...string) error {
-	mkfs, err := exec.LookPath("mkfs.erofs")
-	if err != nil {
-		return fmt.Errorf("mkfs.erofs is not available: %v", err)
-	}
-	cmd := fmt.Sprintf("%s %s %s %s", mkfs, strings.Join(options, " "), image, source)
-	if out, err := exec.Command("/bin/sh", "-c", cmd).CombinedOutput(); err != nil {
-		return fmt.Errorf("exec: sh -c %q, err: %v, out: %s", cmd, err, out)
-	}
-	return nil
-}
-
 // erofsImageInfo contains information about a created EROFS image.
 type erofsImageInfo struct {
 	name    string
