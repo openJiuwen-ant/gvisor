@@ -40,6 +40,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
+	"gvisor.dev/gvisor/runsc/boot/filter"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/fsgofer"
@@ -706,5 +707,100 @@ func TestSignalUnkillablePolicyMapping(t *testing.T) {
 		if got := signalUnkillablePolicy(tc.confPolicy); got != tc.kernelPolicy {
 			t.Errorf("signalUnkillablePolicy(%v) = %v, want %v", tc.confPolicy, got, tc.kernelPolicy)
 		}
+	}
+}
+
+func TestStartForkedRequiresNetstack(t *testing.T) {
+	conf := testConfig()
+	conf.Network = config.NetworkHost
+	l, cleanup, err := createLoader(conf, testSpec())
+	if err != nil {
+		t.Fatalf("error creating loader: %v", err)
+	}
+	defer l.Destroy()
+	defer cleanup()
+
+	args := &CreateLinksAndRoutesArgs{
+		LoopbackLinks: []LoopbackLink{{Name: "lo"}},
+	}
+	l.mu.Lock()
+	l.templateSandbox = true
+	l.state = started
+	l.mu.Unlock()
+	err = l.ctrl.manager.StartForked(args, nil)
+	if err == nil {
+		t.Fatalf("StartForked on network=host succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "requires netstack") {
+		t.Fatalf("StartForked error = %v, want requires netstack", err)
+	}
+}
+
+// TestStartForkedSeccompFailure checks that a failed final security step leaves
+// the sandbox gated and prevents a second initialization attempt.
+func TestStartForkedSeccompFailure(t *testing.T) {
+	l, cleanup, err := createLoader(testConfig(), testSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	defer l.Destroy()
+
+	// SetFilter changes no_new_privs before validating the filter. Retire this
+	// thread when the test goroutine exits instead of reusing it in other tests.
+	runtime.LockOSThread()
+	l.root.conf.DisableSeccomp = false
+	l.mu.Lock()
+	l.templateSandbox = true
+	l.state = started
+	l.mu.Unlock()
+	options, err := l.seccompFilterOptions(l.ctrl.srv.FD())
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := filter.Precompile(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	program.Bytecode32 = append([]uint32(nil), program.Bytecode32...)
+	program.Bytecode32[0] |= 0xffff
+	l.templateSeccompProgram = &program
+	args := &CreateLinksAndRoutesArgs{}
+	err = l.ctrl.manager.StartForked(args, nil)
+	if err == nil || !strings.Contains(err.Error(), "installing prepared seccomp filters") {
+		t.Fatalf("StartForked with invalid seccomp filter: %v", err)
+	}
+	if !l.templateSandbox {
+		t.Error("failed security initialization released the sandbox")
+	}
+	if err := l.ctrl.manager.StartForked(args, nil); err == nil {
+		t.Error("StartForked retried after a security failure")
+	}
+	if err := l.ctrl.manager.Resume(nil, nil); err == nil {
+		t.Error("Resume bypassed failed security initialization")
+	}
+}
+
+// TestStartForkedRequiresSeccomp checks that disabling seccomp cannot bypass the
+// child's final security step.
+func TestStartForkedRequiresSeccomp(t *testing.T) {
+	l, cleanup, err := createLoader(testConfig(), testSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	defer l.Destroy()
+	l.mu.Lock()
+	l.templateSandbox = true
+	l.state = started
+	l.mu.Unlock()
+	err = l.ctrl.manager.StartForked(&CreateLinksAndRoutesArgs{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "requires Sentry seccomp") {
+		t.Fatalf("StartForked without seccomp: %v", err)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.templateSandbox || l.networkArgs != nil {
+		t.Error("rejected startup changed the sandbox's initialization state")
 	}
 }

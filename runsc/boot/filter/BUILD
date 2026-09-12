@@ -27,6 +27,7 @@ go_library(
     ],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/bpf",
         "//pkg/log",
         "//pkg/seccomp",
         "//pkg/seccomp/precompiledseccomp",

@@ -304,16 +304,34 @@ func (s *Server) lookup(method string) (registeredMethod, bool) {
 	return rm, ok
 }
 
-// handleOne handles a single call.
+// ServeOne handles one RPC, closes client, and returns both the transport
+// error and the RPC handler error. The handler error is also marshaled back to
+// the client when possible.
+//
+// +checklocksexclude:s.mu
+func (s *Server) ServeOne(client *unet.Socket) (error, error) {
+	s.clientRegister(client)
+	defer s.clientUnregister(client)
+	return s.handleOneWithRPCErr(client)
+}
+
+// handleOne handles one RPC for the normal server loop. It returns only the
+// transport error; RPC handler errors are marshaled back to the client.
 //
 // +checklocksexclude:s.mu
 func (s *Server) handleOne(client *unet.Socket) error {
+	err, _ := s.handleOneWithRPCErr(client)
+	return err
+}
+
+// +checklocksexclude:s.mu
+func (s *Server) handleOneWithRPCErr(client *unet.Socket) (error, error) {
 	// Unmarshal the call.
 	var c serverCall
 	newFs, err := unmarshal(client, &c)
 	if err != nil {
 		// Client is dead.
-		return err
+		return err, nil
 	}
 	var result callResult
 	log.Debugf("urpc: handling RPC call for method %s", c.Method)
@@ -331,7 +349,7 @@ func (s *Server) handleOne(client *unet.Socket) error {
 	// Start the request.
 	if !s.clientBeginRequest(client) {
 		// Client is dead; don't process this call.
-		return errStopped
+		return errStopped, nil
 	}
 	defer s.clientEndRequest(client)
 
@@ -340,14 +358,14 @@ func (s *Server) handleOne(client *unet.Socket) error {
 	if !ok {
 		// Try to serialize the error.
 		result.Err = ErrUnknownMethod.Error()
-		return marshal(client, &result, nil)
+		return marshal(client, &result, nil), ErrUnknownMethod
 	}
 
 	// Unmarshal the arguments now that we know the type.
 	na := reflect.New(rm.argType.Elem())
 	if err := json.Unmarshal(c.Arg, na.Interface()); err != nil {
 		result.Err = err.Error()
-		return marshal(client, &result, nil)
+		return marshal(client, &result, nil), err
 	}
 
 	// Set the file payload as an argument.
@@ -359,8 +377,9 @@ func (s *Server) handleOne(client *unet.Socket) error {
 	re := reflect.New(rm.resultType.Elem())
 	rValues := rm.fn.Call([]reflect.Value{rm.rcvr, na, re})
 	if errVal := rValues[0].Interface(); errVal != nil {
-		result.Err = errVal.(error).Error()
-		return marshal(client, &result, nil)
+		err := errVal.(error)
+		result.Err = err.Error()
+		return marshal(client, &result, nil), err
 	}
 
 	// Set the resulting payload.
@@ -370,14 +389,14 @@ func (s *Server) handleOne(client *unet.Socket) error {
 		if len(fs) > maxFiles {
 			// Ugh. Send an error to the client, despite success.
 			result.Err = ErrTooManyFiles.Error()
-			return marshal(client, &result, nil)
+			return marshal(client, &result, nil), ErrTooManyFiles
 		}
 	}
 
 	// Marshal the result.
 	result.Success = true
 	result.Result = re.Interface()
-	return marshal(client, &result, fs)
+	return marshal(client, &result, fs), nil
 }
 
 func logRequest(c serverCall, result *callResult) {

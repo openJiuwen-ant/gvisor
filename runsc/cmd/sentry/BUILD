@@ -9,6 +9,7 @@ package(
 go_binary(
     name = "gvisor_sentry",
     srcs = ["sentry_main.go"],
+    gotags = ["gvisor_runtime_clone"],
     noasan = True,
     pure = True,
     visibility = ["//visibility:public"],
@@ -22,7 +23,10 @@ go_binary(
 go_binary(
     name = "gvisor_sentry-race",
     srcs = ["sentry_main.go"],
-    gotags = ["lockdep"],
+    gotags = [
+        "gvisor_runtime_clone",
+        "lockdep",
+    ],
     noasan = True,
     race = "on",
     static = True,
@@ -76,7 +80,10 @@ go_cov(
 go_binary(
     name = "gvisor_sentry_plugin_stack",
     srcs = ["sentry_main_plugin_stack.go"],
-    gotags = ["network_plugins"],
+    gotags = [
+        "gvisor_runtime_clone",
+        "network_plugins",
+    ],
     nogo = False,
     pure = False,
     static = True,

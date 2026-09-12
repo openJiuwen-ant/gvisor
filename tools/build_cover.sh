@@ -67,7 +67,7 @@ cp "$main_go" "$gvisor_gopath/src/gvisor.dev/gvisor/$main_go"
 cd "$gvisor_gopath/src/gvisor.dev/gvisor/"
 export GOROOT="$goroot_dir"
 go_opts=""
-go_tags="kcov,opensource"
+go_tags="kcov,opensource,gvisor_runtime_clone"
 if [[ "$race" = true ]]; then
   go_opts="-race"
   go_tags="$go_tags,lockdep"

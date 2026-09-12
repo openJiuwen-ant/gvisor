@@ -781,6 +781,12 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 			return nil, nil, fmt.Errorf("failed to create memory file for overlay: %v", err)
 		}
 		tmpfsOpts.MemoryFile = mf
+		if c.l.templateSandbox {
+			if err := c.l.k.AddFileBackedTmpfsMF(dst, mf); err != nil {
+				mf.Destroy()
+				return nil, nil, fmt.Errorf("failed to register file-backed overlay memory file for %q: %w", dst, err)
+			}
+		}
 		sourceTar, err := c.l.fsRestore.tmpfsSourceTar(resourceID, c.containerID)
 		if err != nil {
 			mf.Destroy()
@@ -1031,6 +1037,15 @@ func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, 
 		}
 		defer cleanup()
 		fsName = overlay.Name
+	}
+	if fsName == tmpfs.Name {
+		if tmpfsOpts, ok := opts.GetFilesystemOptions.InternalData.(tmpfs.FilesystemOpts); ok && tmpfsOpts.MemoryFile != nil {
+			if c.l.templateSandbox {
+				if err := c.l.k.AddFileBackedTmpfsMF(submount.mount.Destination, tmpfsOpts.MemoryFile); err != nil {
+					return nil, fmt.Errorf("failed to register file-backed tmpfs memory file for %q: %w", submount.mount.Destination, err)
+				}
+			}
+		}
 	}
 
 	mount := submount.mount
