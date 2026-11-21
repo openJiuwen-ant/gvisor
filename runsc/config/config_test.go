@@ -66,6 +66,9 @@ func TestFromFlags(t *testing.T) {
 	if err := testFlags.Lookup("gofer-network-namespace").Value.Set("host"); err != nil {
 		t.Errorf("Flag set: %v", err)
 	}
+	if err := testFlags.Lookup("cpu-num").Value.Set("8"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
 
 	c, err := NewFromFlags(testFlags)
 	if err != nil {
@@ -85,6 +88,9 @@ func TestFromFlags(t *testing.T) {
 	}
 	if want := GoferNetworkNamespaceHost; c.GoferNetworkNamespace != want {
 		t.Errorf("GoferNetworkNamespace=%v, want: %v", c.GoferNetworkNamespace, want)
+	}
+	if want := 8; c.CPUNum != want {
+		t.Errorf("CPUNum=%v, want: %v", c.CPUNum, want)
 	}
 
 	if err := testFlags.Lookup("network").Value.Set("sandbox"); err != nil {
