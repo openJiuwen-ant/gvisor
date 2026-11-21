@@ -47,6 +47,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -250,6 +251,13 @@ type Options struct {
 // seed from unix.Getpid() and increment per endpoint. This is not
 // collision-free across sentries that share a network namespace.
 var fallbackFanoutID atomicbitops.Int32 = atomicbitops.FromInt32(int32(unix.Getpid()))
+
+// ReseedFallbackFanoutID resets the process-local PACKET_FANOUT id allocator
+// used when PACKET_FANOUT_FLAG_UNIQUEID is not supported by the host kernel.
+// A fork child must install a fresh rand.Reader before calling this function.
+func ReseedFallbackFanoutID() {
+	fallbackFanoutID.Store(int32(rand.Uint32()))
+}
 
 // New creates a new fd-based endpoint.
 //

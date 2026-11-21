@@ -317,3 +317,12 @@ func (c *CalibratedClocks) GetTime(id ClockID) (int64, error) {
 		return 0, linuxerr.EINVAL
 	}
 }
+
+// Reset implements Clocks.Reset.
+func (c *CalibratedClocks) Reset(msg string) {
+	c.monotonic.reset(msg)
+	c.realtime.reset(msg)
+	if c.monotonicRaw != nil {
+		c.monotonicRaw.reset(msg)
+	}
+}

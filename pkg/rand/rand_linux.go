@@ -72,12 +72,9 @@ func (b *bufferedReader) Read(p []byte) (int, error) {
 	return io.ReadAtLeast(b.r, p, min)
 }
 
-// Reader is the default reader.
-var Reader io.Reader = &bufferedReader{r: bufio.NewReader(&reader{})}
-
-// Read reads from the default reader.
-func Read(b []byte) (int, error) {
-	return io.ReadFull(Reader, b)
+// NewReader returns a cryptographically secure reader with its own empty buffer.
+func NewReader() io.Reader {
+	return &bufferedReader{r: bufio.NewReader(&reader{})}
 }
 
 // Init can be called to make sure /dev/urandom is pre-opened on kernels that

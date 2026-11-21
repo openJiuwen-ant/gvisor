@@ -16,10 +16,27 @@ package rand
 
 import (
 	"math/rand"
+	"strings"
 	"testing"
+	"testing/iotest"
 )
 
 const testIterations = 100_000
+
+func TestReadUsesUpdatedReader(t *testing.T) {
+	defer UpdateReader(Reader)
+	const want = "abcd"
+	UpdateReader(iotest.OneByteReader(strings.NewReader(want)))
+
+	var got [len(want)]byte
+	n, err := Read(got[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(want) || string(got[:]) != want {
+		t.Errorf("Read = (%d, %q), want (%d, %q)", n, got, len(want), want)
+	}
+}
 
 func TestInt63n(t *testing.T) {
 	for i := 0; i < testIterations; i++ {

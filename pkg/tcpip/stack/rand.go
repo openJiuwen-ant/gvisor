@@ -15,10 +15,16 @@
 package stack
 
 import (
+	"io"
 	"math/rand"
 
+	cryptorand "gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sync"
 )
+
+type randomStateResetter interface {
+	ResetRandomState(cryptorand.RNG)
+}
 
 // lockedRandomSource provides a threadsafe rand.Source.
 type lockedRandomSource struct {
@@ -41,4 +47,28 @@ func (r *lockedRandomSource) Seed(seed int64) {
 	r.mu.Lock()
 	r.src.Seed(seed)
 	r.mu.Unlock()
+}
+
+// ResetRandomState replaces random state used for future network operations.
+// Random values already assigned to existing endpoints and conntrack entries
+// are preserved.
+//
+// Preconditions: The stack must be externally quiesced.
+func (s *Stack) ResetRandomState(reader io.Reader) {
+	if reader == nil {
+		panic("nil random reader")
+	}
+	secureRNG := cryptorand.RNGFrom(reader)
+	s.secureRNG = secureRNG
+	s.insecureRNG.Seed(secureRNG.Int63())
+	s.seed = secureRNG.Uint32()
+
+	for _, state := range s.transportProtocols {
+		if resetter, ok := state.proto.(randomStateResetter); ok {
+			resetter.ResetRandomState(secureRNG)
+		}
+	}
+	if resetter, ok := s.NFTables().(randomStateResetter); ok {
+		resetter.ResetRandomState(secureRNG)
+	}
 }

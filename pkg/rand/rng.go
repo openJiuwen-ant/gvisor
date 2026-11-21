@@ -22,6 +22,22 @@ import (
 	"io"
 )
 
+// Reader supplies randomness to the package-level functions.
+var Reader = NewReader()
+
+// UpdateReader sets Reader to the cryptographically secure source r.
+// The source must support concurrent reads. The integer helpers also expect
+// reads of up to eight bytes to fill the buffer or return an error.
+// The caller must ensure the assignment does not race with other uses of Reader.
+func UpdateReader(r io.Reader) {
+	Reader = r
+}
+
+// Read fills b with random bytes from Reader.
+func Read(b []byte) (int, error) {
+	return io.ReadFull(Reader, b)
+}
+
 // RNG exposes convenience functions based on a cryptographically secure
 // io.Reader.
 type RNG struct {

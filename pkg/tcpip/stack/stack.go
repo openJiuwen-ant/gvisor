@@ -165,7 +165,7 @@ type Stack struct {
 	// by the stack.
 	icmpRateLimiter *ICMPRateLimiter
 
-	// seed is a one-time random value initialized at stack startup.
+	// seed is a random value used to initialize new hash state.
 	//
 	// TODO(gvisor.dev/issue/940): S/R this field.
 	seed uint32
@@ -205,8 +205,7 @@ type Stack struct {
 	// Setting this to 0 will disable all rate limiting.
 	tcpInvalidRateLimit time.Duration
 
-	// tsOffsetSecret is the secret key for generating timestamp offsets
-	// initialized at stack startup.
+	// tsOffsetSecret is the secret key for generating timestamp offsets.
 	tsOffsetSecret uint32
 
 	// removeConf indicates whether to remove NICs and routes and terminate
@@ -2713,7 +2712,7 @@ func (s *Stack) SetNUDConfigurations(id tcpip.NICID, proto tcpip.NetworkProtocol
 
 // Seed returns a 32 bit value that can be used as a seed value.
 //
-// NOTE: The seed is generated once during stack initialization only.
+// The seed may change when ResetRandomState is called.
 func (s *Stack) Seed() uint32 {
 	return s.seed
 }

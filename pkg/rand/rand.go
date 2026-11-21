@@ -17,12 +17,12 @@
 
 package rand
 
-import "crypto/rand"
+import (
+	"crypto/rand"
+	"io"
+)
 
-// Reader is the default reader.
-var Reader = rand.Reader
-
-// Read implements io.Reader.Read.
-func Read(b []byte) (int, error) {
-	return rand.Read(b)
+// NewReader returns crypto/rand.Reader.
+func NewReader() io.Reader {
+	return rand.Reader
 }

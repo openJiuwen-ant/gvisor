@@ -473,6 +473,13 @@ func (t *Timekeeper) Resume(params *VDSOParamPage) {
 	t.startAfterFuncSchedulerLocked()
 }
 
+// Reset restarts clock calibration. The Timekeeper must be paused.
+func (t *Timekeeper) Reset(msg string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.clocks.Reset(msg)
+}
+
 // GetTime returns the current time in nanoseconds.
 func (t *Timekeeper) GetTime(c sentrytime.ClockID) (int64, error) {
 	if t.clocks == nil {

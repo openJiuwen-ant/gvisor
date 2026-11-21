@@ -435,6 +435,13 @@ func NewNFTables(stack *stack.Stack, clock tcpip.Clock, rng rand.RNG) *NFTables 
 	return &NFTables{stack: stack, clock: clock, startTime: clock.Now(), rng: rng, tableHandleCounter: atomicbitops.Uint64{}, genid: 1}
 }
 
+// ResetRandomState replaces the random source used for future nftables
+// operations. Random values assigned to existing conntrack entries are
+// preserved.
+func (nf *NFTables) ResetRandomState(rng rand.RNG) {
+	nf.rng = rng
+}
+
 // GetGenID returns the generation ID for the NFTables object.
 func (nf *NFTables) GetGenID() uint32 {
 	return nf.genid
