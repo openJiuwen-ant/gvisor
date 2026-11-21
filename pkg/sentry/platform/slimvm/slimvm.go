@@ -78,11 +78,8 @@ func New(opts platform.Options) (*SlimVM, error) {
 	}
 	opts.StartupTimer.Reached("slimvm global state initialized")
 
-	// Parse sandbox ID for the host kernel module.
-	sid, _ := strconv.ParseInt(opts.SandboxID[:min(8, len(opts.SandboxID))], 16, 64)
-
 	// Create a VM context.
-	machine, err := newMachine(sid, opts.ApplicationCores, opts.StartupTimer)
+	machine, err := newMachine(parseSandboxID(opts.SandboxID), opts.ApplicationCores, opts.StartupTimer)
 	if err != nil {
 		return nil, err
 	}
@@ -96,6 +93,11 @@ func New(opts platform.Options) (*SlimVM, error) {
 		UseHostProcessMemoryBarrier: platform.UseHostProcessMemoryBarrier{MemBarrier: memBarrier},
 		machine:                     machine,
 	}, nil
+}
+
+func parseSandboxID(sandboxID string) int64 {
+	sid, _ := strconv.ParseInt(sandboxID[:min(8, len(sandboxID))], 16, 64)
+	return sid
 }
 
 // SupportsAddressSpaceIO implements platform.Platform.SupportsAddressSpaceIO.
