@@ -36,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/gomaxprocs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/metric"
@@ -789,7 +790,7 @@ func New(args Args) (*Loader, error) {
 		args.NumCPU = runtime.NumCPU()
 	}
 	log.Infof("CPUs: %d", args.NumCPU)
-	runtime.GOMAXPROCS(args.NumCPU)
+	gomaxprocs.SetBase(args.NumCPU)
 	args.StartupTimer.Reached("GOMAXPROCS set")
 
 	// Start filesystem checkpoint restore as soon as possible to maximize
@@ -2903,9 +2904,6 @@ func (l *Loader) updateForkMetadata(id string, env []string) {
 		}
 	}
 	l.k.RestoreContainerMapping(l.containerIDs)
-	if env != nil {
-		l.k.SetContainerEnv(id, env)
-	}
 
 	for _, task := range l.k.TaskSet().Root.Tasks() {
 		if task.ContainerID() == oldID {

@@ -37,7 +37,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/pkg/urpc"
-	"gvisor.dev/gvisor/runsc/boot/sentryapi"
+	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/config"
 	runscflag "gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/hostsettings"
@@ -275,9 +275,9 @@ func newReadyBaseSpec(rootfsDir, rootfsImage string, waitReady bool) *specs.Spec
 	if spec.Annotations == nil {
 		spec.Annotations = make(map[string]string)
 	}
-	spec.Annotations[sentryapi.RootfsPrefix+"type"] = erofs.Name
-	spec.Annotations[sentryapi.RootfsPrefix+"source"] = rootfsImage
-	spec.Annotations[sentryapi.RootfsPrefix+"overlay"] = config.NoOverlay.String()
+	spec.Annotations[boot.RootfsPrefix+"type"] = erofs.Name
+	spec.Annotations[boot.RootfsPrefix+"source"] = rootfsImage
+	spec.Annotations[boot.RootfsPrefix+"overlay"] = config.NoOverlay.String()
 	return spec
 }
 
@@ -364,7 +364,7 @@ func templateForkE2EBaseConf(t testing.TB) *config.Config {
 type templateForkE2ENetwork struct {
 	guestIP     net.IP
 	peerLink    netlink.Link
-	networkArgs *sentryapi.CreateLinksAndRoutesArgs
+	networkArgs *boot.CreateLinksAndRoutesArgs
 }
 
 type templateForkE2ENetworkPool struct {
@@ -401,7 +401,7 @@ func setupTemplateForkE2ENetworkPool(t testing.TB, count int) *templateForkE2ENe
 	ready := newTemplateForkE2EReadyServer(t, hostIP)
 
 	prefixLen, _ := mask.Size()
-	route := sentryapi.Route{
+	route := boot.Route{
 		Destination: net.IPNet{
 			IP:   hostIP.Mask(mask),
 			Mask: mask,
@@ -418,21 +418,21 @@ func setupTemplateForkE2ENetworkPool(t testing.TB, count int) *templateForkE2ENe
 		guestIP := net.IPv4(198, 18, 1, byte(i+2))
 		hostLink, peerLink := createTemplateForkE2EVeth(t, hostName, peerName, bridge)
 
-		networkArgs := &sentryapi.CreateLinksAndRoutesArgs{
-			LoopbackLinks: []sentryapi.LoopbackLink{sentryapi.DefaultLoopbackLink},
-			FDBasedLinks: []sentryapi.FDBasedLink{
+		networkArgs := &boot.CreateLinksAndRoutesArgs{
+			LoopbackLinks: []boot.LoopbackLink{boot.DefaultLoopbackLink},
+			FDBasedLinks: []boot.FDBasedLink{
 				{
 					Name:              peerLink.Attrs().Name,
 					InterfaceIndex:    peerLink.Attrs().Index,
 					MTU:               peerLink.Attrs().MTU,
 					NumChannels:       1,
 					LinkAddress:       peerLink.Attrs().HardwareAddr,
-					Addresses:         []sentryapi.IPWithPrefix{{Address: guestIP, PrefixLen: prefixLen}},
-					Routes:            []sentryapi.Route{route},
+					Addresses:         []boot.IPWithPrefix{{Address: guestIP, PrefixLen: prefixLen}},
+					Routes:            []boot.Route{route},
 					GSOMaxSize:        templateForkE2EGSOMaxSize(peerLink),
 					RXChecksumOffload: true,
 					QDisc:             config.QDiscFIFO,
-					Neighbors: []sentryapi.Neighbor{
+					Neighbors: []boot.Neighbor{
 						{
 							IP:           hostIP,
 							HardwareAddr: bridge.Attrs().HardwareAddr,
@@ -453,7 +453,7 @@ func setupTemplateForkE2ENetworkPool(t testing.TB, count int) *templateForkE2ENe
 	return pool
 }
 
-func (n templateForkE2ENetwork) createNetworkArgs(t testing.TB) (*sentryapi.CreateLinksAndRoutesArgs, func()) {
+func (n templateForkE2ENetwork) createNetworkArgs(t testing.TB) (*boot.CreateLinksAndRoutesArgs, func()) {
 	t.Helper()
 	deviceFile, err := createTemplateForkE2ERawSocket(n.peerLink)
 	if err != nil {
@@ -672,7 +672,7 @@ type startRootBreakdown struct {
 	rootStartRPC time.Duration
 }
 
-func startWithNetworkArgs(c *Container, conf *config.Config, networkArgs *sentryapi.CreateLinksAndRoutesArgs) (startRootBreakdown, error) {
+func startWithNetworkArgs(c *Container, conf *config.Config, networkArgs *boot.CreateLinksAndRoutesArgs) (startRootBreakdown, error) {
 	var breakdown startRootBreakdown
 	startRoot := func(conf *config.Config, spec *specs.Spec) error {
 		start := time.Now()
@@ -690,13 +690,13 @@ func startWithNetworkArgs(c *Container, conf *config.Config, networkArgs *sentry
 		breakdown.connect = time.Since(start)
 
 		start = time.Now()
-		if err := conn.Call(sentryapi.ContMgrSetNetworkArgs, networkArgs, nil); err != nil {
+		if err := conn.Call(boot.ContMgrSetNetworkArgs, networkArgs, nil); err != nil {
 			return fmt.Errorf("setting network args: %w", err)
 		}
 		breakdown.networkRPC = time.Since(start)
 
 		start = time.Now()
-		if err := conn.Call(sentryapi.ContMgrRootContainerStart, &c.ID, nil); err != nil {
+		if err := conn.Call(boot.ContMgrRootContainerStart, &c.ID, nil); err != nil {
 			return fmt.Errorf("starting root container: %w", err)
 		}
 		breakdown.rootStartRPC = time.Since(start)
@@ -858,20 +858,20 @@ func runTemplateForkE2EForkOnce(t testing.TB, conf *config.Config, netPool *temp
 	}
 }
 
-func cloneTemplateForkE2ENetworkArgs(src *sentryapi.CreateLinksAndRoutesArgs) *sentryapi.CreateLinksAndRoutesArgs {
+func cloneTemplateForkE2ENetworkArgs(src *boot.CreateLinksAndRoutesArgs) *boot.CreateLinksAndRoutesArgs {
 	if src == nil {
 		return nil
 	}
 	dst := *src
 	dst.FilePayload.Files = append([]*os.File(nil), src.FilePayload.Files...)
-	dst.LoopbackLinks = append([]sentryapi.LoopbackLink(nil), src.LoopbackLinks...)
-	dst.FDBasedLinks = append([]sentryapi.FDBasedLink(nil), src.FDBasedLinks...)
+	dst.LoopbackLinks = append([]boot.LoopbackLink(nil), src.LoopbackLinks...)
+	dst.FDBasedLinks = append([]boot.FDBasedLink(nil), src.FDBasedLinks...)
 	for i := range dst.FDBasedLinks {
-		dst.FDBasedLinks[i].Addresses = append([]sentryapi.IPWithPrefix(nil), src.FDBasedLinks[i].Addresses...)
-		dst.FDBasedLinks[i].Routes = append([]sentryapi.Route(nil), src.FDBasedLinks[i].Routes...)
-		dst.FDBasedLinks[i].Neighbors = append([]sentryapi.Neighbor(nil), src.FDBasedLinks[i].Neighbors...)
+		dst.FDBasedLinks[i].Addresses = append([]boot.IPWithPrefix(nil), src.FDBasedLinks[i].Addresses...)
+		dst.FDBasedLinks[i].Routes = append([]boot.Route(nil), src.FDBasedLinks[i].Routes...)
+		dst.FDBasedLinks[i].Neighbors = append([]boot.Neighbor(nil), src.FDBasedLinks[i].Neighbors...)
 	}
-	dst.XDPLinks = append([]sentryapi.XDPLink(nil), src.XDPLinks...)
+	dst.XDPLinks = append([]boot.XDPLink(nil), src.XDPLinks...)
 	return &dst
 }
 

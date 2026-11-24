@@ -105,12 +105,7 @@ func bluepillTest(t testHarness, fn func(*vCPU)) {
 }
 
 func TestDropReload(t *testing.T) {
-	t.Run("unshifted", func(t *testing.T) { testDropReload(t, 0) })
-	t.Run("shifted", func(t *testing.T) { testDropReload(t, 1<<40) })
-}
-
-func testDropReload(t *testing.T, offset uint64) {
-	k := newTestKVM(t, Config{TSCOffset: offset})
+	k := newTestKVM(t, Config{})
 	defer k.machine.Destroy()
 	as, err := k.NewAddressSpace(platform.AddressSpaceOptions{})
 	if err != nil {

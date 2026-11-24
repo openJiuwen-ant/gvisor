@@ -110,8 +110,8 @@ func TestPrivateAnonymousCheckpoint(t *testing.T) {
 							t.Fatal(err)
 						}
 						loadOpts.PagesFile, err = StartAsyncPagesFileLoad(
-							stateio.NewPagesFileFDReaderDefault(int32(pageFD), 2 /* numCPUs */),
-							func(err error) { done <- err }, nil, AsyncPagesFileLoadOpts{})
+							stateio.NewPagesFileFDReaderDefault(int32(pageFD)),
+							func(err error) { done <- err }, nil)
 						if err != nil {
 							t.Fatal(err)
 						}

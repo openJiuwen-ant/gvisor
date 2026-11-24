@@ -23,6 +23,7 @@ go_sum="$4"
 main_go="$5" # Path of the main package Go file, relative to the repository root.
 golang_patch=$(realpath "$6")
 race="$7"
+clone_patch=$(realpath "$8")
 
 mkdir .gocache
 GOMODCACHE="$(pwd)/.gocache"
@@ -51,6 +52,7 @@ export GOMODCACHE GOCACHE
   curl -fsSL "${go_base_url}.src.tar.gz" | tar -xz
   cd go
   patch -p1 < "$golang_patch"
+  patch -p1 < "$clone_patch"
   cd src
   ./make.bash
 )

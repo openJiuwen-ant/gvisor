@@ -48,6 +48,7 @@ COVERAGE_SRCS = [
     "//:gopath",
     "//tools:build_cover.sh",
     "//tools:go-allow-internal.patch",
+    "//tools:go_support_clone.patch",
 ]
 
 COVERAGE_CMD = (
@@ -58,7 +59,8 @@ COVERAGE_CMD = (
     "\"$(execpath //:go.sum)\" " +
     "\"$(execpath sentry_main.go)\" " +
     "\"$(execpath //tools:go-allow-internal.patch)\" " +
-    "\"%s\" "
+    "\"%s\" " +
+    "\"$(execpath //tools:go_support_clone.patch)\" "
 )
 
 go_cov(
