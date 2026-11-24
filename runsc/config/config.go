@@ -346,6 +346,10 @@ type Config struct {
 	// E.g. 0.2 CPU quota will result in 1, and 1.9 in 2.
 	CPUNumFromQuota bool `flag:"cpu-num-from-quota"`
 
+	// CPUNum sets the number of CPUs created inside the sandbox. Zero leaves
+	// CPU count detection unchanged.
+	CPUNum int `flag:"cpu-num"`
+
 	// Allows overriding of flags in OCI annotations.
 	AllowFlagOverride bool `flag:"allow-flag-override"`
 
@@ -592,6 +596,9 @@ func (c *Config) Validate() error {
 	if c.NumNetworkChannels <= 0 {
 		return fmt.Errorf("num_network_channels must be > 0, got: %d", c.NumNetworkChannels)
 	}
+	if c.CPUNum < 0 {
+		return fmt.Errorf("cpu-num must be >= 0, got: %d", c.CPUNum)
+	}
 	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")
 	}
@@ -655,6 +662,7 @@ func (c *Config) Log() {
 	log.Infof("RootDir: %s", c.RootDir)
 	log.Infof("FileAccess: %v / Directfs: %t / Overlay: %v", c.FileAccess, c.DirectFS, c.GetOverlay2())
 	log.Infof("Network: %v", c.Network)
+	log.Infof("CPUNum: %d", c.CPUNum)
 	log.Infof("UseCPUNums: %t", c.UseCPUNums)
 	if c.Debug || c.Strace {
 		log.Infof("Debug: %t. Strace: %t, max size: %d, syscalls: %s", c.Debug, c.Strace, c.StraceLogSize, c.StraceSyscalls)

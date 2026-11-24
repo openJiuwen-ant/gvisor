@@ -18,6 +18,7 @@ import (
 	"math/rand"
 	"os"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -91,6 +92,108 @@ func bluepillTest(t testHarness, fn func(*vCPU)) {
 	slimvmTest(t, nil, func(c *vCPU) bool {
 		bluepill(c)
 		fn(c)
+		return false
+	})
+}
+
+func TestDropReload(t *testing.T) {
+	slimvmTest(t, func(k *SlimVM) {
+		c := k.machine.Get()
+		k.machine.Put(c)
+		oldFD := slimvmFile.FD()
+		k.Drop()
+		k.Drop()
+		if _, err := unix.FcntlInt(uintptr(oldFD), unix.F_GETFD, 0); err != unix.EBADF {
+			t.Fatalf("Drop left the device open: %v", err)
+		}
+		invalid, err := OpenDevice("/dev/null")
+		if err != nil {
+			t.Fatal(err)
+		}
+		invalidFD := invalid.FD()
+		if err := k.Reload(invalid); err == nil {
+			t.Fatal("Reload accepted an invalid device")
+		}
+		if _, err := unix.FcntlInt(uintptr(invalidFD), unix.F_GETFD, 0); err != unix.EBADF {
+			t.Fatalf("Reload did not close the rejected device: %v", err)
+		}
+		if slimvmFile != nil || len(k.machine.vCPUs) != 0 {
+			t.Fatal("failed Reload left resident resources installed")
+		}
+		device, err := OpenDevice("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := k.Reload(device); err != nil {
+			t.Fatal(err)
+		}
+	}, func(c *vCPU) bool {
+		bluepill(c)
+		redpill()
+		if c.state.Load() != vCPUUser {
+			t.Error("vCPU did not return to its ready state after Reload")
+		}
+		return false
+	})
+}
+
+// TestGetReclaimsVCPU exhausts the vCPU pool with a host thread blocked in a
+// forwarded syscall after returning its vCPU to the machine.
+func TestGetReclaimsVCPU(t *testing.T) {
+	slimvmTest(t, func(k *SlimVM) {
+		k.machine.maxVCPUs = 1
+		var pipe [2]int
+		if err := unix.Pipe2(pipe[:], unix.O_CLOEXEC); err != nil {
+			t.Fatal(err)
+		}
+		defer unix.Close(pipe[0])
+		defer unix.Close(pipe[1])
+		ready := make(chan struct{})
+		exited := make(chan error, 1)
+		go func() {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			c := k.machine.Get()
+			bluepill(c)
+			k.machine.Put(c)
+			close(ready)
+			var err error
+			for {
+				_, err = unix.Ppoll([]unix.PollFd{{Fd: int32(pipe[0]), Events: unix.POLLIN}}, nil, nil)
+				if err != unix.EINTR {
+					break
+				}
+			}
+			redpill()
+			// Also wake a blocked Get on the failure path.
+			c = k.machine.Get()
+			k.machine.Put(c)
+			exited <- err
+		}()
+		<-ready
+		acquired := make(chan struct{})
+		go func() {
+			c := k.machine.Get()
+			bluepill(c)
+			redpill()
+			k.machine.Put(c)
+			close(acquired)
+		}()
+		defer func() {
+			if _, err := unix.Write(pipe[1], []byte{1}); err != nil {
+				t.Error(err)
+			}
+			if err := <-exited; err != nil {
+				t.Error(err)
+			}
+			<-acquired
+		}()
+		select {
+		case <-acquired:
+		case <-time.After(10 * time.Second):
+			t.Fatal("Get did not reclaim the idle vCPU")
+		}
+	}, func(c *vCPU) bool {
 		return false
 	})
 }
@@ -529,4 +632,19 @@ func TestMain(m *testing.M) {
 	cpuid.Initialize()
 	dummyFPState = fpu.NewState()
 	os.Exit(m.Run())
+}
+
+func TestOpenDeviceCloseOnExec(t *testing.T) {
+	device, err := OpenDevice("/dev/null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer device.Close()
+	flags, err := unix.FcntlInt(uintptr(device.FD()), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flags&unix.FD_CLOEXEC == 0 {
+		t.Fatal("platform device may be inherited by an unrelated exec")
+	}
 }

@@ -220,6 +220,7 @@ go_test(
         "live_save_timer_test.go",
         "endpoint_test.go",
         "main_test.go",
+        "protocol_state_test.go",
         "rack_test.go",
         "reno_test.go",
         "sack_scoreboard_test.go",

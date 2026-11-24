@@ -16,6 +16,7 @@
 package sandbox
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -92,12 +93,12 @@ func controlSocketName(id string) string {
 	return fmt.Sprintf("runsc-%s.sock", id)
 }
 
-// createControlSocket finds a location and creates the socket used to
+// CreateControlSocket finds a location and creates the socket used to
 // communicate with the sandbox. The socket is a UDS on the host filesystem.
 //
 // Note that abstract sockets are *not* used, because any user can connect to
 // them. There is no file mode protecting abstract sockets.
-func createControlSocket(rootDir, id string) (string, int, error) {
+func CreateControlSocket(rootDir, id string) (string, int, error) {
 	name := controlSocketName(id)
 
 	// Only use absolute paths to guarantee resolution from anywhere.
@@ -112,6 +113,19 @@ func createControlSocket(rootDir, id string) (string, int, error) {
 		log.Debugf("Failed to create socket file %q: %v", path, err)
 	}
 	return "", -1, fmt.Errorf("unable to find location to write socket file")
+}
+
+func createProtectedSocket(path string) (int, error) {
+	fd, err := server.CreateSocket(path)
+	if err != nil {
+		return -1, err
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		unix.Close(fd)
+		_ = os.Remove(path)
+		return -1, fmt.Errorf("chmod socket %q: %w", path, err)
+	}
+	return fd, nil
 }
 
 // Pid is an atomic type that implements JSON marshal/unmarshal interfaces.
@@ -234,6 +248,9 @@ type Sandbox struct {
 	// Depending on the caller's mount namespace, the path can vary.
 	rootDir string `nojson:"true"`
 
+	// TemplateSocketID identifies one generation of a template independently of its container ID.
+	TemplateSocketID string `json:"templateSocketID,omitempty"`
+
 	// child is set if a sandbox process is a child of the current process.
 	//
 	// This field isn't saved to json, because only a creator of sandbox
@@ -267,6 +284,11 @@ type Sandbox struct {
 	//
 	// +checklocks:savingsMu
 	WallTimeSaved time.Duration `json:"wallTimeSaved"`
+
+	// Template indicates that this sandbox is a template sandbox: after boot it
+	// pauses and serves SandboxTemplate.Fork on its template Unix socket.
+	// Drives skip-networking behavior in StartRoot.
+	Template bool `json:"template"`
 }
 
 // Getpid returns the process ID of the sandbox process.
@@ -329,6 +351,11 @@ type Args struct {
 	// If the caller exits, the sandbox should exit too.
 	Attached bool
 
+	// Stdin, Stdout and Stderr override the root container stdio when non-nil.
+	Stdin  *os.File
+	Stdout *os.File
+	Stderr *os.File
+
 	// SinkFiles is the an ordered array of files to be used by seccheck sinks
 	// configured from the --pod-init-config file.
 	SinkFiles []*os.File
@@ -349,6 +376,51 @@ type Args struct {
 	// NoRootContainer boots without a root container: no gofer FDs, no root
 	// process. See container.Args.NoRootContainer.
 	NoRootContainer bool
+	// TemplateSandbox is true to spawn the sandbox in template mode: an extra
+	// template Unix socket is created and donated to the boot process,
+	// the --template-sandbox boot flag is set, GODEBUG=runtimeclone=1 is set
+	// on the sandbox process environment so the patched Go runtime
+	// allows the template's runtime.Clone() call, and StartRoot skips the
+	// network setupNetwork step (the template has no use for a populated
+	// netstack; the post-fork child re-runs cold-boot network setup).
+	TemplateSandbox   bool
+	TemplateWorkers   int
+	TemplateReadyFile *os.File
+}
+
+// ForkArgs contains the host resources needed to fork a child sandbox from a
+// template sandbox.
+type ForkArgs struct {
+	// Template is the seed serving SandboxTemplate.Fork.
+	Template *Sandbox
+
+	// Env overrides /proc/gvisor/spec_environ when non-nil.
+	Env []string
+
+	// Stdout and Stderr are donated to the forked child as its root stdio.
+	// They must be writable regular files opened with O_APPEND. If nil,
+	// os.Stdout and os.Stderr are used and must satisfy the same constraints.
+	Stdout *os.File
+	Stderr *os.File
+
+	// NetworkArgs configures the forked sandbox netstack. It must be provided;
+	// fork does not profile or configure host network state.
+	NetworkArgs *boot.CreateLinksAndRoutesArgs
+
+	// BackendFiles are per-child backend files for file-backed tmpfs/overlay
+	// mounts inherited from the template.
+	BackendFiles []ForkBackendFile
+
+	// BeforeStart is called after the child sandbox pid is known and moved into
+	// its cgroup, but before networking, seccomp, and checkpoint notification.
+	BeforeStart func() error
+}
+
+// ForkBackendFile is a host file donated to a forked child as the backend for
+// a file-backed tmpfs/overlay mount.
+type ForkBackendFile struct {
+	MountPoint string
+	File       *os.File
 }
 
 // New creates the sandbox process. The caller must call Destroy() on the
@@ -366,6 +438,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 		MountHints:          args.MountHints,
 		StartTime:           starttime.Get(),
 		NoRootContainer:     args.NoRootContainer,
+		Template:            args.TemplateSandbox,
 	}
 	if args.Spec != nil && args.Spec.Annotations != nil {
 		s.PodName = args.Spec.Annotations[podNameAnnotation]
@@ -491,15 +564,21 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 	}
 	defer conn.Close()
 
-	var disableIPv6 bool
-	disableIPv6, err = getDisableIPv6(spec)
-	if err != nil {
-		return err
+	if !s.Template {
+		var disableIPv6 bool
+		disableIPv6, err = getDisableIPv6(spec)
+		if err != nil {
+			return err
+		}
+		// Configure the network.
+		if err := setupNetwork(conn, pid, conf, disableIPv6, false); err != nil {
+			return fmt.Errorf("setting up network: %w", err)
+		}
 	}
-	// Configure the network.
-	if err := setupNetwork(conn, pid, conf, disableIPv6, false); err != nil {
-		return fmt.Errorf("setting up network: %w", err)
-	}
+	// Template sandboxes intentionally leave the netstack empty. Children
+	// created from a template are later finished by Sandbox.Fork, which
+	// configures networking, installs seccomp filters, and releases the
+	// checkpoint wait inherited from the template.
 
 	// Send a message to the sandbox control server to start the root container.
 	if err := conn.Call(boot.ContMgrRootContainerStart, &s.ID, nil); err != nil {
@@ -507,6 +586,152 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 	}
 
 	return nil
+}
+
+// Fork creates and starts this sandbox by asking an existing template sandbox to
+// clone itself. On success, the forked root task has networking configured,
+// seccomp installed, and its checkpoint wait notified.
+func (s *Sandbox) Fork(conf *config.Config, args ForkArgs) error {
+	if err := hostsettings.Handle(conf); err != nil {
+		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
+	}
+	if args.NetworkArgs == nil {
+		return fmt.Errorf("forked sandbox requires explicit network arguments")
+	}
+	if args.Template == nil {
+		return fmt.Errorf("forked sandbox requires a template")
+	}
+	log.Debugf("Fork sandbox %q from template %q", s.ID, args.Template.ID)
+
+	controlSocketPath, sockFD, err := CreateControlSocket(conf.RootDir, s.ID)
+	if err != nil {
+		return fmt.Errorf("failed to create control socket: %w", err)
+	}
+	s.ControlSocketPath = controlSocketPath
+	controlFile := os.NewFile(uintptr(sockFD), "control_server_socket")
+	defer controlFile.Close()
+
+	deviceFile, err := deviceFileForFork(conf)
+	if err != nil {
+		return err
+	}
+	defer deviceFile.Close()
+
+	stdout := args.Stdout
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	stderr := args.Stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	if err := specutils.ValidateStdioFile(stdout, "fork stdout"); err != nil {
+		return err
+	}
+	if err := specutils.ValidateStdioFile(stderr, "fork stderr"); err != nil {
+		return err
+	}
+
+	templateConn, err := connectControlSocket(args.Template.TemplateSocketPath(conf.RootDir))
+	if err != nil {
+		return err
+	}
+	defer templateConn.Close()
+	if args.Template.TemplateSocketID == "" {
+		// Older templates use a reusable socket name. Check the original
+		// process after connecting, before sending resources to this peer.
+		running, err := args.Template.IsRunning()
+		if err != nil || !running {
+			return fmt.Errorf("template %q is no longer running", args.Template.ID)
+		}
+	}
+
+	forkArgs := boot.TemplateForkArgs{
+		ID:                  s.ID,
+		Env:                 args.Env,
+		UserStdoutFileIndex: 0,
+		UserStderrFileIndex: 1,
+		UrpcServerFileIndex: 2,
+		DeviceFileIndex:     3,
+		FilePayload: urpc.FilePayload{
+			Files: []*os.File{stdout, stderr, controlFile, deviceFile},
+		},
+	}
+	for _, backendFile := range args.BackendFiles {
+		if backendFile.File == nil {
+			return fmt.Errorf("backend file for mount point %q is nil", backendFile.MountPoint)
+		}
+		forkArgs.BackendFileInfo = append(forkArgs.BackendFileInfo, boot.BackendFileInfo{
+			MountPoint:     backendFile.MountPoint,
+			FilestoreIndex: len(forkArgs.FilePayload.Files),
+		})
+		forkArgs.FilePayload.Files = append(forkArgs.FilePayload.Files, backendFile.File)
+	}
+	var forkRet boot.TemplateForkResult
+	if err := templateConn.Call("SandboxTemplate.Fork", &forkArgs, &forkRet); err != nil {
+		return fmt.Errorf("forking sandbox from template %q: %w", args.Template.ID, err)
+	}
+
+	childConn, err := connectControlSocket(controlSocketPath)
+	if err != nil {
+		return fmt.Errorf("connecting to forked sandbox %q: %w", s.ID, err)
+	}
+	defer childConn.Close()
+
+	ucred, err := unix.GetsockoptUcred(int(childConn.Socket.FD()), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	if err != nil {
+		return fmt.Errorf("reading forked sandbox credentials: %w", err)
+	}
+	if ucred.Pid <= 0 || int(ucred.Pid) == os.Getpid() {
+		return fmt.Errorf("forked control socket has invalid peer PID %d", ucred.Pid)
+	}
+	s.Pid.Store(int(ucred.Pid))
+	if s.PidIdentity, err = specutils.ProcessIdentity(s.Getpid()); err != nil {
+		return fmt.Errorf("reading forked sandbox process identity: %w", err)
+	}
+	s.UID = int(ucred.Uid)
+	s.GID = int(ucred.Gid)
+
+	if err := cgroup.MovePid(s.CgroupJSON.Cgroup, s.Getpid()); err != nil {
+		return fmt.Errorf("moving forked sandbox to cgroup: %w", err)
+	}
+	if args.BeforeStart != nil {
+		if err := args.BeforeStart(); err != nil {
+			return err
+		}
+	}
+
+	if err := childConn.Call(boot.ContMgrStartForked, args.NetworkArgs, nil); err != nil {
+		return fmt.Errorf("starting forked sandbox: %w", err)
+	}
+	return nil
+}
+
+func connectControlSocket(sockPath string) (*urpc.Client, error) {
+	if len(sockPath) >= linux.UnixPathMax {
+		sockFD, err := unix.Open(sockPath, unix.O_PATH, 0)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open socket at %q: %w", sockPath, err)
+		}
+		defer unix.Close(sockFD)
+		sockPath = filepath.Join("/proc/self/fd", strconv.Itoa(sockFD))
+	}
+	return client.ConnectTo(sockPath)
+}
+
+func deviceFileForFork(conf *config.Config) (*os.File, error) {
+	gPlatform, err := platform.Lookup(conf.Platform)
+	if err != nil {
+		return nil, fmt.Errorf("cannot look up platform: %w", err)
+	}
+	deviceFD, err := gPlatform.OpenDevice(conf.PlatformDevicePath)
+	if err != nil {
+		return nil, fmt.Errorf("opening device file for platform %q: %w", conf.Platform, err)
+	}
+	if deviceFD == nil {
+		return nil, fmt.Errorf("platform %q does not provide a device file for template fork", conf.Platform)
+	}
+	return deviceFD.ReleaseToFile("device file"), nil
 }
 
 // StartSubcontainer starts running a sub-container inside the sandbox.
@@ -852,6 +1077,14 @@ func (s *Sandbox) SetRootDir(rootDir string) {
 	s.rootDir = rootDir
 }
 
+// TemplateSocketPath returns the listener for this generation of the template.
+func (s *Sandbox) TemplateSocketPath(rootDir string) string {
+	if s.TemplateSocketID == "" {
+		return boot.TemplateServerAddr(rootDir, s.ID)
+	}
+	return boot.TemplateServerAddr(rootDir, s.TemplateSocketID)
+}
+
 // GetControlSocketPath returns the control socket path for the sandbox.
 func (s *Sandbox) GetControlSocketPath() string {
 	return s.getControlSocketPath()
@@ -1088,14 +1321,17 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	donations.DonateAndClose("mounts-fd", args.MountsFile)
 	donations.Donate("start-sync-fd", startSyncFile)
 	var pinRing *os.File
-	if _, err := gvisorbinaries.FDParking.Path(); err != nil {
-		log.Warningf("Sidecar %q not found or usable (%v). This slows down gVisor sandbox teardown.", gvisorbinaries.FDParking.Name, err)
-	} else if ring, err := pinring.NewDisabledIOURing(); err != nil {
-		log.Warningf("Cannot create disabled io_uring ring: %v. This slows down gVisor sandbox teardown.", err)
-	} else {
-		pinRing = ring
-		defer pinRing.Close()
-		donations.Donate("pin-ring-fd", pinRing)
+	// A template cannot share a finalized ring with its forked children.
+	if !args.TemplateSandbox {
+		if _, err := gvisorbinaries.FDParking.Path(); err != nil {
+			log.Warningf("Sidecar %q not found or usable (%v). This slows down gVisor sandbox teardown.", gvisorbinaries.FDParking.Name, err)
+		} else if ring, err := pinring.NewDisabledIOURing(); err != nil {
+			log.Warningf("Cannot create disabled io_uring ring: %v. This slows down gVisor sandbox teardown.", err)
+		} else {
+			pinRing = ring
+			defer pinRing.Close()
+			donations.Donate("pin-ring-fd", pinRing)
+		}
 	}
 	if err := donations.DonateLogFile("user-log-fd", args.UserLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, lfOpts); err != nil {
 		return err
@@ -1116,7 +1352,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 
 	// Create a socket for the control server and donate it to the sandbox.
-	controlSocketPath, sockFD, err := createControlSocket(conf.RootDir, s.ID)
+	controlSocketPath, sockFD, err := CreateControlSocket(conf.RootDir, s.ID)
 	if err != nil {
 		return fmt.Errorf("failed to create control socket: %v", err)
 	}
@@ -1124,6 +1360,19 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	log.Infof("Control socket path: %q", s.ControlSocketPath)
 	donations.DonateAndClose("controller-fd", os.NewFile(uintptr(sockFD), "control_server_socket"))
 
+	if args.TemplateSandbox {
+		cmd.Args = append(cmd.Args, "--template-sandbox=true", fmt.Sprintf("--template-workers=%d", args.TemplateWorkers))
+		donations.Donate("template-ready-fd", args.TemplateReadyFile)
+		socketID := rand.Text()
+		path := boot.TemplateServerAddr(conf.RootDir, socketID)
+		templateFD, err := createProtectedSocket(path)
+		if err != nil {
+			return fmt.Errorf("creating sandbox template server socket for sandbox %q: %w", s.ID, err)
+		}
+		s.TemplateSocketID = socketID
+		s.rootDir = conf.RootDir
+		donations.DonateAndClose("template-server-fd", os.NewFile(uintptr(templateFD), "template_server_socket"))
+	}
 	specFile, err := specutils.OpenSpec(args.BundleDir)
 	if err != nil {
 		return fmt.Errorf("cannot open spec file in bundle dir %v: %w", args.BundleDir, err)
@@ -1169,15 +1418,18 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		donations.DonateAndClose("device-fd", deviceFile.ReleaseToFile("device file"))
 	}
 
-	// TODO(b/151157106): syscall tests fail by timeout if asyncpreemptoff
-	// isn't set.
+	var godebug []string
 	if conf.Platform == "kvm" || conf.Platform == "slimvm" {
-		cmd.Env = append(cmd.Env, "GODEBUG=asyncpreemptoff=1")
+		godebug = append(godebug, "asyncpreemptoff=1")
 	}
-
 	if conf.Network == config.NetworkPlugin {
-		cmd.Env = append(cmd.Env, "GODEBUG=cgocheck=0")
+		godebug = append(godebug, "cgocheck=0")
 	}
+	if args.TemplateSandbox {
+		godebug = append(godebug, "runtimeclone=1")
+	}
+	// Go only reads the first GODEBUG variable in the environment.
+	cmd.Env = append(cmd.Env, "GODEBUG="+strings.Join(godebug, ","))
 
 	// nss is the set of namespaces to join or create before starting the sandbox
 	// process. Mount, IPC and UTS namespaces from the host are not used as they
@@ -1374,16 +1626,25 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	} else {
 		// If not using a console, pass our current stdio as the
 		// container stdio via flags.
-		stdios[0] = os.Stdin
-		stdios[1] = os.Stdout
-		stdios[2] = os.Stderr
+		stdios[0] = args.Stdin
+		if stdios[0] == nil {
+			stdios[0] = os.Stdin
+		}
+		stdios[1] = args.Stdout
+		if stdios[1] == nil {
+			stdios[1] = os.Stdout
+		}
+		stdios[2] = args.Stderr
+		if stdios[2] == nil {
+			stdios[2] = os.Stderr
+		}
 
 		if conf.Debug {
 			// If debugging, send the boot process stdio to the
 			// this process' stdio, so that is is easier to find.
-			cmd.Stdin = os.Stdin
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
+			cmd.Stdin = stdios[0]
+			cmd.Stdout = stdios[1]
+			cmd.Stderr = stdios[2]
 		}
 	}
 	if err := s.configureStdios(conf, stdios[:]); err != nil {
@@ -1416,6 +1677,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		if err != nil {
 			return err
 		}
+		if conf.CPUNum > 0 {
+			cpuNum = conf.CPUNum
+		}
 		cmd.Args = append(cmd.Args, "--cpu-num", strconv.Itoa(cpuNum))
 		if cpuQuota > 0 {
 			cmd.Args = append(cmd.Args, "--cpu-quota", strconv.FormatInt(cpuQuota, 10))
@@ -1431,6 +1695,8 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		if memLimit < mem {
 			mem = memLimit
 		}
+	} else if conf.CPUNum > 0 {
+		cmd.Args = append(cmd.Args, "--cpu-num", strconv.Itoa(conf.CPUNum))
 	}
 	cmd.Args = append(cmd.Args, "--total-memory", strconv.FormatUint(mem, 10))
 
@@ -1706,6 +1972,12 @@ func (s *Sandbox) IsRootContainer(cid string) bool {
 // is idempotent.
 func (s *Sandbox) destroy() error {
 	log.Debugf("Destroying sandbox %q", s.ID)
+	if s.Template && s.rootDir != "" {
+		path := s.TemplateSocketPath(s.rootDir)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Warningf("failed to delete template socket file %q: %v", path, err)
+		}
+	}
 	// Only delete the control file if it exists.
 	controlSocketPath := s.getControlSocketPath()
 	if len(controlSocketPath) > 0 {
@@ -2684,6 +2956,15 @@ func (s *Sandbox) destroyContainer(cid string) error {
 		return fmt.Errorf("destroying container %q: %w", cid, err)
 	}
 	return nil
+}
+
+// ReapTemplate reaps a template created by this process after another
+// caller has destroyed it.
+func (s *Sandbox) ReapTemplate() error {
+	if !s.child {
+		return nil
+	}
+	return s.waitForStopped()
 }
 
 // waitForStopped waits for the sandbox to actually stop.

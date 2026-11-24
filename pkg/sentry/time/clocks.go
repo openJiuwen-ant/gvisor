@@ -52,4 +52,7 @@ type Clocks interface {
 	//
 	// It must return the same value for the lifetime of the Clocks.
 	MonotonicRawEnabled() bool
+
+	// Reset restarts clock calibration, logging msg for diagnostics.
+	Reset(msg string)
 }

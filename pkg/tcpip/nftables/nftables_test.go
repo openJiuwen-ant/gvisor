@@ -47,6 +47,22 @@ const (
 	arbitraryReservedHeaderBytes int                 = 16
 )
 
+func TestResetRandomState(t *testing.T) {
+	initialReader := bytes.NewReader(make([]byte, 64))
+	s := stack.New(stack.Options{SecureRNG: initialReader})
+	nf := NewNFTables(s, faketime.NewManualClock(), rand.RNGFrom(initialReader))
+	s.SetNFTables(nf)
+	resetReader := bytes.NewReader(bytes.Repeat([]byte{0xff}, 64))
+
+	s.Pause()
+	s.ResetRandomState(resetReader)
+	s.Resume()
+
+	if got := nf.rng.Reader; got != resetReader {
+		t.Errorf("nftables RNG reader = %p, want %p", got, resetReader)
+	}
+}
+
 var (
 	arbitraryPriority Priority = func() Priority {
 		priority, err := NewStandardPriority("filter", arbitraryFamily, arbitraryHook)

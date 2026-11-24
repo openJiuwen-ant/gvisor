@@ -1,3 +1,4 @@
+load("//test/benchmarks:defs.bzl", "benchmark_test")
 load("//tools:defs.bzl", "default_platform", "go_library", "go_test", "most_shards", "platforms")
 
 package(
@@ -14,6 +15,7 @@ go_library(
         "null_netns.go",
         "state_file.go",
         "status.go",
+        "template.go",
     ],
     visibility = [
         "//runsc:__subpackages__",
@@ -22,6 +24,7 @@ go_library(
     deps = [
         "//pkg/abi/linux",
         "//pkg/cleanup",
+        "//pkg/control/client",
         "//pkg/log",
         "//pkg/sentry/checkpoint",
         "//pkg/sentry/control",
@@ -42,6 +45,7 @@ go_library(
         "//runsc/specutils",
         "//runsc/starttime",
         "@com_github_gofrs_flock//:go_default_library",
+        "@com_github_mohae_deepcopy//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
@@ -54,10 +58,12 @@ go_test(
         "console_test.go",
         "container_save_restore_test.go",
         "container_test.go",
+        "container_testutil_test.go",
         "metric_server_test.go",
         "multi_container_save_restore_test.go",
         "multi_container_test.go",
         "shared_volume_test.go",
+        "template_fork_test.go",
         "trace_test.go",
     ],
     # Only run the default platform for the tsan test, which should
@@ -72,6 +78,7 @@ go_test(
     }),
     data = [
         "//:release",
+        "//test/cmd/fork_state",
         "//test/cmd/test_app",
     ],
     embed = [":container"],
@@ -80,6 +87,9 @@ go_test(
     deps = [
         "//pkg/abi/linux",
         "//pkg/cleanup",
+        "//pkg/control/client",
+        "//pkg/control/server",
+        "//pkg/cpuid",
         "//pkg/hostos",
         "//pkg/log",
         "//pkg/seccheck/scsdk",
@@ -99,10 +109,13 @@ go_test(
         "//pkg/sync",
         "//pkg/test/testutil",
         "//pkg/unet",
+        "//pkg/urpc",
         "//runsc/boot",
+        "//runsc/boot/procfs",
         "//runsc/cgroup",
         "//runsc/config",
         "//runsc/flag",
+        "//runsc/hostsettings",
         "//runsc/sandbox",
         "//runsc/specutils",
         "//test/metricclient",
@@ -110,6 +123,7 @@ go_test(
         "@com_github_creack_pty//:go_default_library",
         "@com_github_google_go_cmp//cmp:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@com_github_vishvananda_netlink//:go_default_library",
         "@org_golang_google_grpc//:go_default_library",
         "@org_golang_google_protobuf//proto:go_default_library",
         "@org_golang_google_protobuf//types/known/emptypb:go_default_library",
@@ -178,4 +192,71 @@ go_test(
     size = "small",
     srcs = ["state_file_inventory_test.go"],
     embed = [":container"],
+)
+
+go_test(
+    name = "template_fork_e2e_test",
+    size = "large",
+    srcs = [
+        "container_testutil_test.go",
+        "template_fork_e2e_main_test.go",
+        "template_fork_e2e_test.go",
+    ],
+    data = [
+        "//:release",
+        "//test/cmd/fork_ready",
+    ],
+    embed = [":container"],
+    tags = [
+        "manual",
+        "requires-kvm",
+    ],
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/control/client",
+        "//pkg/log",
+        "//pkg/sentry/fsimpl/erofs",
+        "//pkg/test/testutil",
+        "//pkg/urpc",
+        "//runsc/boot",
+        "//runsc/config",
+        "//runsc/flag",
+        "//runsc/hostsettings",
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@com_github_vishvananda_netlink//:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+benchmark_test(
+    name = "template_fork_startup_benchmark_test",
+    srcs = [
+        "container_testutil_test.go",
+        "template_fork_e2e_test.go",
+        "template_fork_startup_benchmark_test.go",
+    ],
+    data = [
+        "//:release",
+        "//test/cmd/fork_ready",
+    ],
+    embed = [":container"],
+    tags = ["requires-kvm"],
+    use_for_pgo = False,
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/control/client",
+        "//pkg/log",
+        "//pkg/sentry/fsimpl/erofs",
+        "//pkg/test/testutil",
+        "//pkg/urpc",
+        "//runsc/boot",
+        "//runsc/config",
+        "//runsc/flag",
+        "//runsc/hostsettings",
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@com_github_vishvananda_netlink//:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
 )

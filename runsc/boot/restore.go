@@ -136,6 +136,16 @@ func (l *Loader) SaveAsync() (err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if l.templateSandbox {
+		select {
+		case <-l.templateCheckpoint:
+			return linuxerr.EBUSY
+		default:
+			close(l.templateCheckpoint)
+			return nil
+		}
+	}
+
 	cu := cleanup.Make(func() {
 		// Save failed, unblock the callers as the workload will resume.
 		l.k.OnCheckpointAttempt(err)

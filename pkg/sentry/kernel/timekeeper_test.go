@@ -68,6 +68,9 @@ func (c *mockClocks) GetTime(id sentrytime.ClockID) (int64, error) {
 	}
 }
 
+// Reset implements sentrytime.Clocks.Reset. It does nothing.
+func (*mockClocks) Reset(string) {}
+
 // stateTestClocklessTimekeeper returns a test Timekeeper which has not had
 // SetClocks called.
 func stateTestClocklessTimekeeper(tb testing.TB) (*Timekeeper, *VDSOParamPage) {

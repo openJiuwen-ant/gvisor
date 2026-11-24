@@ -16,8 +16,10 @@ package urpc
 
 import (
 	"errors"
+	"io"
 	"os"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/unet"
 )
@@ -43,8 +45,10 @@ func (t test) Func(a *testArg, r *testResult) error {
 	return nil
 }
 
+var errTest = errors.New("test error")
+
 func (t test) Err(a *testArg, r *testResult) error {
-	return errors.New("test error")
+	return errTest
 }
 
 func (t test) FailNoFile(a *testArg, r *testResult) error {
@@ -206,5 +210,60 @@ func TestTooManyFiles(t *testing.T) {
 		t.Errorf("expected non-nil err, got nil")
 	} else if err.Error() != "too many files" {
 		t.Errorf("expected too many files, got %v", err.Error())
+	}
+}
+
+func TestServeOne(t *testing.T) {
+	for _, tc := range []struct {
+		name, method string
+		transportErr error
+		handlerErr   error
+	}{
+		{name: "success", method: "test.Func"},
+		{name: "handler error", method: "test.Err", handlerErr: errTest},
+		{name: "disconnect", transportErr: io.EOF},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			serverSock, clientSock, err := unet.SocketPair(false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := NewServer()
+			s.Register(test{})
+			type result struct{ transportErr, handlerErr error }
+			done := make(chan result, 1)
+			go func() {
+				transportErr, handlerErr := s.ServeOne(serverSock)
+				done <- result{transportErr, handlerErr}
+			}()
+
+			c := NewClient(clientSock)
+			if tc.method == "" {
+				c.Close()
+			} else {
+				defer c.Close()
+				var r testResult
+				err := c.Call(tc.method, &testArg{StringArg: "hello"}, &r)
+				if tc.handlerErr != nil {
+					if err == nil || err.Error() != tc.handlerErr.Error() {
+						t.Errorf("Call = %v, want %v", err, tc.handlerErr)
+					}
+				} else if err != nil || r.StringResult != "hello" {
+					t.Errorf("Call returned %q, %v; want hello, nil", r.StringResult, err)
+				}
+			}
+			select {
+			case got := <-done:
+				if !errors.Is(got.transportErr, tc.transportErr) || !errors.Is(got.handlerErr, tc.handlerErr) {
+					t.Errorf("ServeOne = (%v, %v), want (%v, %v)", got.transportErr, got.handlerErr, tc.transportErr, tc.handlerErr)
+				}
+				if serverSock.FD() >= 0 {
+					serverSock.Close()
+					t.Error("ServeOne left the socket open")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("ServeOne did not return")
+			}
+		})
 	}
 }

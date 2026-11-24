@@ -42,6 +42,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
@@ -172,6 +173,11 @@ type Kernel struct {
 
 	// mf provides application memory.
 	mf *pgalloc.MemoryFile `state:"nosave"`
+
+	// fileBackedTmpfsMFs maps mount points to file-backed tmpfs memory files.
+	// It is used by sandbox fork to replace template-owned backend files with
+	// per-child backend files after runtime.Clone.
+	fileBackedTmpfsMFs map[string]*pgalloc.MemoryFile `state:"nosave"`
 
 	// See InitKernelArgs for the meaning of these fields.
 	featureSet           cpuid.FeatureSet
@@ -1126,6 +1132,112 @@ func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 	return nil
 }
 
+// InvalidateMappings invalidates guest mappings that must not survive sandbox
+// fork.
+//
+// Preconditions: The kernel must be paused and platform execution must have
+// stopped. This is intended for the template process before runtime.Clone.
+func (k *Kernel) InvalidateMappings() error {
+	tmpfs.SetInvalidateUnsavable(true)
+	defer tmpfs.SetInvalidateUnsavable(false)
+
+	return k.invalidateUnsavableMappings(k.SupervisorContext())
+}
+
+// UpdateMemoryFileFilestore replaces each registered file-backed tmpfs
+// MemoryFile's underlying fd with the corresponding entry in backendFiles.
+// FICLONE keeps the template's existing extents shared when supported;
+// otherwise a byte copy preserves correctness on filesystems without reflink
+// support.
+// Dup2 preserves the fd number used by MemoryFile operations, then
+// RegenerateMappings switches inherited host mappings to the new file.
+func (k *Kernel) UpdateMemoryFileFilestore(backendFiles map[string]*os.File) error {
+	if len(k.fileBackedTmpfsMFs) == 0 {
+		if len(backendFiles) != 0 {
+			return fmt.Errorf("got backend files for fork, but template has no file-backed tmpfs memory files")
+		}
+		return nil
+	}
+	if len(k.fileBackedTmpfsMFs) != len(backendFiles) {
+		return fmt.Errorf("got %d backend files for fork, want %d", len(backendFiles), len(k.fileBackedTmpfsMFs))
+	}
+
+	// Validate all files before replacing any mapping. A destination must
+	// not alias any template backing file or another destination.
+	type fileID struct {
+		dev uint64
+		ino uint64
+	}
+	sources := make(map[fileID]bool)
+	destinations := make(map[fileID]bool)
+	for _, mf := range k.fileBackedTmpfsMFs {
+		var st unix.Stat_t
+		if err := unix.Fstat(mf.FD(), &st); err != nil {
+			return fmt.Errorf("stat template backing file: %w", err)
+		}
+		sources[fileID{st.Dev, st.Ino}] = true
+	}
+
+	for mountPoint := range k.fileBackedTmpfsMFs {
+		file := backendFiles[mountPoint]
+		if file == nil {
+			return fmt.Errorf("missing backend file for mount point %q", mountPoint)
+		}
+
+		var st unix.Stat_t
+		if err := unix.Fstat(int(file.Fd()), &st); err != nil {
+			return fmt.Errorf("stat backend file for %q: %w", mountPoint, err)
+		}
+		if st.Mode&unix.S_IFMT != unix.S_IFREG {
+			return fmt.Errorf("backend file for %q is not regular", mountPoint)
+		}
+
+		flags, err := unix.FcntlInt(file.Fd(), unix.F_GETFL, 0)
+		if err != nil {
+			return fmt.Errorf("backend file flags for %q: %w", mountPoint, err)
+		}
+		if flags&unix.O_ACCMODE != unix.O_RDWR || flags&unix.O_APPEND != 0 {
+			return fmt.Errorf("backend file for %q must be readable and writable without O_APPEND", mountPoint)
+		}
+
+		id := fileID{st.Dev, st.Ino}
+		if sources[id] || destinations[id] {
+			return fmt.Errorf("backend file for %q aliases another backing file", mountPoint)
+		}
+		destinations[id] = true
+	}
+
+	for mountPoint, mf := range k.fileBackedTmpfsMFs {
+		file := backendFiles[mountPoint]
+		srcFD := mf.FD()
+		dstFD := int(file.Fd())
+		if err := mf.CloneBackingFile(dstFD); err != nil {
+			return fmt.Errorf("cloning backend file for %q: %w", mountPoint, err)
+		}
+
+		if err := unix.Dup2(dstFD, srcFD); err != nil {
+			return fmt.Errorf("replacing backend fd for %q: %w", mountPoint, err)
+		}
+		if err := mf.RegenerateMappings(); err != nil {
+			return fmt.Errorf("remapping memory file for %q: %w", mountPoint, err)
+		}
+	}
+	return nil
+}
+
+// AddFileBackedTmpfsMF registers a MemoryFile used by a file-backed tmpfs or
+// overlay upper layer.
+func (k *Kernel) AddFileBackedTmpfsMF(mountPoint string, mf *pgalloc.MemoryFile) error {
+	if k.fileBackedTmpfsMFs == nil {
+		k.fileBackedTmpfsMFs = make(map[string]*pgalloc.MemoryFile)
+	}
+	if _, exists := k.fileBackedTmpfsMFs[mountPoint]; exists {
+		return fmt.Errorf("file-backed tmpfs memory file already registered for %q", mountPoint)
+	}
+	k.fileBackedTmpfsMFs[mountPoint] = mf
+	return nil
+}
+
 // LoadFrom restores k from r.
 //
 // Preconditions: k is not in use.
@@ -1992,6 +2104,11 @@ func (k *Kernel) Pause() {
 // +checklocksexclude:k.tasks.mu
 func (k *Kernel) IsPaused() bool {
 	return k.tasks.isExternallyStopped()
+}
+
+// VDSOParamPage returns the VDSO parameter page.
+func (k *Kernel) VDSOParamPage() *VDSOParamPage {
+	return k.vdsoParams
 }
 
 // ReceiveTaskStates receives full states for all tasks.

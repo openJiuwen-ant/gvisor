@@ -19,8 +19,10 @@ package stack_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math"
+	mathrand "math/rand"
 	"net"
 	"sort"
 	"testing"
@@ -105,6 +107,40 @@ func TestRestoreEndpointsAcrossNamespaces(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("cross-namespace endpoint restoration deadlocked")
+	}
+}
+
+func TestResetRandomState(t *testing.T) {
+	s := stack.New(stack.Options{SecureRNG: bytes.NewReader(make([]byte, 64))})
+	insecureRNG := s.InsecureRNG()
+
+	const (
+		insecureSeed int64  = 0x102030405060708
+		stackSeed    uint32 = 0x11223344
+		secureNext   uint32 = 0x55667788
+	)
+	resetBytes := make([]byte, 16)
+	binary.NativeEndian.PutUint64(resetBytes[0:8], uint64(insecureSeed))
+	binary.NativeEndian.PutUint32(resetBytes[8:12], stackSeed)
+	binary.NativeEndian.PutUint32(resetBytes[12:16], secureNext)
+
+	s.Pause()
+	s.ResetRandomState(bytes.NewReader(resetBytes))
+	s.Resume()
+
+	if got := s.InsecureRNG(); got != insecureRNG {
+		t.Fatalf("InsecureRNG() = %p, want original RNG %p", got, insecureRNG)
+	}
+	wantInsecure := mathrand.New(mathrand.NewSource(insecureSeed)).Int63()
+	if got := s.InsecureRNG().Int63(); got != wantInsecure {
+		t.Errorf("InsecureRNG().Int63() = %d, want %d", got, wantInsecure)
+	}
+	if got := s.Seed(); got != stackSeed {
+		t.Errorf("Seed() = %#x, want %#x", got, stackSeed)
+	}
+	secureRNG := s.SecureRNG()
+	if got := secureRNG.Uint32(); got != secureNext {
+		t.Errorf("SecureRNG().Uint32() = %#x, want %#x", got, secureNext)
 	}
 }
 

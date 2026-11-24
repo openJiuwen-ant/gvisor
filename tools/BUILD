@@ -73,4 +73,5 @@ bzl_library(
 exports_files([
     "build_cover.sh",
     "go-allow-internal.patch",
+    "go_support_clone.patch",
 ])

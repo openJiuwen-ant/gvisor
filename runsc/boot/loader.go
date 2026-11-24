@@ -18,8 +18,10 @@ package boot
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	gtime "time"
@@ -42,6 +44,7 @@ import (
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
@@ -86,9 +89,12 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/timing"
+	"gvisor.dev/gvisor/pkg/unet"
+	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/filter"
 	pf "gvisor.dev/gvisor/runsc/boot/portforward"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
+	"gvisor.dev/gvisor/runsc/boot/templatestub"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -120,6 +126,9 @@ const (
 	// RuntimeStateStopped indicates that the container has stopped.
 	RuntimeStateStopped
 )
+
+// runtimeClone is set by builds using the patched Go runtime.
+var runtimeClone func(preclone func(int), waiting func() bool, postclone func(int), flags, workers int, ready func())
 
 type containerInfo struct {
 	cid string
@@ -380,6 +389,31 @@ type Loader struct {
 
 	// hostinetNetSNMPFile is the pre-opened /proc/net/snmp file for hostinet restore.
 	hostinetNetSNMPFile *os.File
+
+	// templateSandbox is set to true if this is a template sandbox: the loader
+	// will boot the kernel and root container normally, but skip network
+	// setup and seccomp install, and after run() will enter serveTemplate(), which
+	// pauses the kernel and waits for SandboxTemplate.Fork RPCs on the
+	// template socket.
+	templateSandbox bool
+	templateWorkers int
+	templateReadyFD int
+
+	// templateOutputs pins the imported stdout and stderr so they can be rebound
+	// in each child even if the workload closes or redirects them during setup.
+	templateOutputs [2]*vfs.FileDescription
+
+	// templateCheckpoint is closed by the first guest checkpoint request.
+	// It is initialized before tasks start and remains closed in fork children.
+	templateCheckpoint chan struct{}
+
+	// templateServerFD is the file descriptor of the Unix socket on which
+	// the template listens for fork requests. Donated to the boot process via
+	// --template-server-fd. Unused unless templateSandbox is true.
+	templateServerFD int
+
+	// templateSeccompProgram is rendered with each child's own PID and FDs.
+	templateSeccompProgram *precompiledseccomp.Program
 }
 
 // noRootContainer is the state of a sandbox with no root container.
@@ -554,6 +588,7 @@ type Args struct {
 	// If FSSaveCheckpointGofer is true, Args.FSSaveFDs contains only one FD,
 	// which is a socket connected to a checkpoint gofer.
 	FSSaveCheckpointGofer bool
+
 	// RootfsUpperTarFD is the file descriptor to the tar file containing the rootfs
 	// upper layer changes.
 	RootfsUpperTarFD int
@@ -565,6 +600,14 @@ type Args struct {
 	// The `Loader` records midpoints on it as it goes through loader creation
 	// and sandbox startup. The `Loader` does not take ownership of it.
 	StartupTimer *timing.Timer
+	// TemplateSandbox is set to true to boot a template sandbox.
+	TemplateSandbox bool
+	TemplateWorkers int
+	TemplateReadyFD int
+	// TemplateServerFD is the file descriptor of the Unix socket on which the
+	// template sandbox should listen for SandboxTemplate.Fork RPCs. It is only
+	// consulted when TemplateSandbox is true.
+	TemplateServerFD int
 }
 
 // HostTHP holds host transparent hugepage settings.
@@ -642,6 +685,32 @@ func shouldEnableClockMonotonicRaw(spec *specs.Spec, conf *config.Config) bool {
 // New initializes a new kernel loader configured by spec.
 // New also handles setting up a kernel for restoring a container.
 func New(args Args) (*Loader, error) {
+	if args.TemplateSandbox {
+		if runtimeClone == nil {
+			return nil, fmt.Errorf("sandbox fork requires the gVisor Go runtime")
+		}
+		if args.TemplateWorkers < 1 || args.TemplateReadyFD < 0 {
+			return nil, fmt.Errorf("template requires workers and a readiness FD")
+		}
+		unix.CloseOnExec(args.TemplateReadyFD)
+		if args.Spec.Annotations == nil {
+			args.Spec.Annotations = make(map[string]string)
+		}
+		args.Spec.Annotations[annotationCheckpointEnable] = "true"
+		// Check before fdimport.Import can register stdio with Go's netpoller.
+		// runtime.Clone requires that no netpoll descriptors remain active.
+		for _, fd := range []int{0, 1, 2} {
+			flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+			if err != nil {
+				continue
+			}
+			if flags&unix.O_NONBLOCK != 0 {
+				log.Warningf("template sandbox stdio fd %d is non-blocking; runtime.Clone requires no active netpoll descriptors", fd)
+				os.Exit(1)
+			}
+		}
+	}
+
 	stopProfilingRuntime := profile.Start(args.ProfileOpts)
 	stopProfiling := func() {
 		stopProfilingRuntime()
@@ -659,7 +728,9 @@ func New(args Args) (*Loader, error) {
 	}
 	args.StartupTimer.Reached("RNG initialized")
 
-	if err := usage.Init(); err != nil {
+	if err := usage.InitWithOpts(usage.InitOpts{
+		PrivateAnonymousMapping: args.TemplateSandbox,
+	}); err != nil {
 		return nil, fmt.Errorf("setting up memory usage: %w", err)
 	}
 	args.StartupTimer.Reached("memory usage initialized")
@@ -709,6 +780,10 @@ func New(args Args) (*Loader, error) {
 		saveCheckpointGofer:   args.SaveCheckpointGofer,
 		fsSaveFDs:             args.FSSaveFDs,
 		fsSaveCheckpointGofer: args.FSSaveCheckpointGofer,
+		templateSandbox:       args.TemplateSandbox,
+		templateWorkers:       args.TemplateWorkers,
+		templateReadyFD:       args.TemplateReadyFD,
+		templateServerFD:      args.TemplateServerFD,
 	}
 
 	if args.NumCPU == 0 {
@@ -730,6 +805,10 @@ func New(args Args) (*Loader, error) {
 			return nil, fmt.Errorf("failed to start filesystem checkpoint restore: %w", err)
 		}
 		l.fsRestore = fsr
+	}
+
+	if args.TemplateSandbox {
+		l.templateCheckpoint = make(chan struct{})
 	}
 
 	containerName := l.registerContainer(args.Spec, args.ID)
@@ -823,7 +902,7 @@ func New(args Args) (*Loader, error) {
 	}
 
 	// Create memory file.
-	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostTHP)
+	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostTHP, args.TemplateSandbox)
 	if err != nil {
 		return nil, fmt.Errorf("creating memory file: %w", err)
 	}
@@ -1068,7 +1147,7 @@ func (l *Loader) ConfigureNetwork(s inet.Stack) error {
 
 	eps, ok := s.(*netstack.Stack)
 	if !ok {
-		return nil
+		return fmt.Errorf("network args require netstack, got %T", s)
 	}
 	if eps.Stack.IPTables() == nil {
 		eps.Stack.SetIPTables(netfilter.DefaultLinuxTables(eps.Stack.Clock(), eps.Stack.InsecureRNG()))
@@ -1167,6 +1246,7 @@ func (l *Loader) Destroy() {
 	// long-running control operations that are in flight, e.g.
 	// profiling operations.
 	l.ctrl.stop()
+	l.releaseTemplateOutputs(ctx)
 
 	// Release all kernel resources. This is only safe after we can no longer
 	// save/restore.
@@ -1219,7 +1299,7 @@ func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxI
 	})
 }
 
-func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, error) {
+func createMemoryFile(appHugePages bool, hostTHP HostTHP, privateAnonymousMapping bool) (*pgalloc.MemoryFile, error) {
 	const memfileName = "runsc-memory"
 	memfd, err := memutil.CreateMemFD(memfileName, 0)
 	if err != nil {
@@ -1231,6 +1311,7 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 		// We can't enable pgalloc.MemoryFileOpts.UseHostMemcgPressure even if
 		// there are memory cgroups specified, because at this point we're already
 		// in a mount namespace in which the relevant cgroupfs is not visible.
+		PrivateAnonymousMapping: privateAnonymousMapping,
 	}
 	if appHugePages {
 		switch hostTHP.ShmemEnabled {
@@ -1283,6 +1364,38 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 	return mf, nil
 }
 
+func (l *Loader) seccompFilterOptions(controllerFD int) (filter.Options, error) {
+	hostnet := l.root.conf.Network == config.NetworkHost
+	var nvproxyCaps nvconf.DriverCaps
+	nvproxyEnabled := specutils.NVProxyEnabled(l.root.spec, l.root.conf)
+	if nvproxyEnabled {
+		var err error
+		// We use the set of allowed capabilities here, not the subset of them
+		// that the root container requests. This is because we need to support
+		// subsequent containers being able to execute with a wider set than the
+		// set that the root container requests. Seccomp filters are only
+		// applied once at sandbox startup, so they need to be as wide as the
+		// set of capabilities that may ever be requested.
+		if nvproxyCaps, err = specutils.NVProxyDriverCapsAllowed(l.root.conf); err != nil {
+			return filter.Options{}, fmt.Errorf("NVIDIA capabilities: %w", err)
+		}
+	}
+	return filter.Options{
+		Platform:              l.k.Platform.SeccompInfo(),
+		HostNetwork:           hostnet,
+		HostNetworkRawSockets: hostnet && l.root.conf.EnableRaw,
+		HostFilesystem:        l.root.conf.DirectFS,
+		ProfileEnable:         l.root.conf.ProfileEnable,
+		NVProxy:               nvproxyEnabled,
+		NVProxyCaps:           nvproxyCaps,
+		TPUProxy:              specutils.TPUProxyEnabled(l.root.spec, l.root.conf),
+		RDMAProxy:             specutils.RDMAEnabled(l.root.spec, l.root.conf),
+		ControllerFD:          uint32(controllerFD),
+		CgoEnabled:            config.CgoEnabled,
+		PluginNetwork:         l.root.conf.Network == config.NetworkPlugin,
+	}, nil
+}
+
 // installSeccompFilters installs sandbox seccomp filters with the host.
 func (l *Loader) installSeccompFilters() error {
 	if l.PreSeccompCallback != nil {
@@ -1291,39 +1404,21 @@ func (l *Loader) installSeccompFilters() error {
 	}
 	if l.root.conf.DisableSeccomp {
 		log.Warningf("*** SECCOMP WARNING: syscall filter is DISABLED. Running in less secure mode.")
-	} else {
-		hostnet := l.root.conf.Network == config.NetworkHost
-		var nvproxyCaps nvconf.DriverCaps
-		nvproxyEnabled := specutils.NVProxyEnabled(l.root.spec, l.root.conf)
-		if nvproxyEnabled {
-			var err error
-			// We use the set of allowed capabilities here, not the subset of them
-			// that the root container requests. This is because we need to support
-			// subsequent containers being able to execute with a wider set than the
-			// set that the root container requests. Seccomp filters are only
-			// applied once at sandbox startup, so they need to be as wide as the
-			// set of capabilities that may ever be requested.
-			if nvproxyCaps, err = specutils.NVProxyDriverCapsAllowed(l.root.conf); err != nil {
-				return fmt.Errorf("NVIDIA capabilities: %w", err)
-			}
+		return nil
+	}
+	opts, err := l.seccompFilterOptions(l.ctrl.srv.FD())
+	if err != nil {
+		return err
+	}
+	if l.templateSeccompProgram != nil {
+		if err := filter.InstallPrecompiled(opts, *l.templateSeccompProgram); err != nil {
+			return fmt.Errorf("installing prepared seccomp filters: %w", err)
 		}
-		opts := filter.Options{
-			Platform:              l.k.Platform.SeccompInfo(),
-			HostNetwork:           hostnet,
-			HostNetworkRawSockets: hostnet && l.root.conf.EnableRaw,
-			HostFilesystem:        l.root.conf.DirectFS,
-			ProfileEnable:         l.root.conf.ProfileEnable,
-			NVProxy:               nvproxyEnabled,
-			NVProxyCaps:           nvproxyCaps,
-			TPUProxy:              specutils.TPUProxyEnabled(l.root.spec, l.root.conf),
-			RDMAProxy:             specutils.RDMAEnabled(l.root.spec, l.root.conf),
-			ControllerFD:          uint32(l.ctrl.srv.FD()),
-			CgoEnabled:            config.CgoEnabled,
-			PluginNetwork:         l.root.conf.Network == config.NetworkPlugin,
-		}
-		if err := filter.Install(opts, l.startupTimer); err != nil {
-			return fmt.Errorf("installing seccomp filters: %w", err)
-		}
+		l.templateSeccompProgram = nil
+		return nil
+	}
+	if err := filter.Install(opts, l.startupTimer); err != nil {
+		return fmt.Errorf("installing seccomp filters: %w", err)
 	}
 	return nil
 }
@@ -1384,12 +1479,13 @@ func (l *Loader) run() error {
 			log.Warningf("Cannot pin files to the pin ring: %v. This slows down gVisor sandbox teardown.", err)
 		}
 
-		// Finally done with all configuration. Setup filters before user code
-		// is loaded.
-		if err := l.installSeccompFilters(); err != nil {
-			return err
+		// Templates install the prepared filter in StartForked after cloning.
+		if !l.templateSandbox {
+			if err := l.installSeccompFilters(); err != nil {
+				return err
+			}
+			l.startupTimer.Reached("seccomp filters installed")
 		}
-		l.startupTimer.Reached("seccomp filters installed")
 
 		if !l.noRootContainer.enabled {
 			// Create the root container init task. It will begin running
@@ -1486,6 +1582,9 @@ func (l *Loader) run() error {
 
 	log.Infof("Process should have started...")
 	l.watchdog.Start()
+	if l.templateSandbox {
+		go l.serveTemplate()
+	}
 	if err := l.k.Start(); err != nil {
 		return err
 	}
@@ -1654,6 +1753,30 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	return nil
 }
 
+func (l *Loader) pinTemplateOutputs(fdTable *kernel.FDTable) error {
+	for i, name := range [...]string{"template stdout", "template stderr"} {
+		file, _ := fdTable.Get(int32(i + 1))
+		l.templateOutputs[i] = file
+		hostFile, ok := file.Impl().(vfs.HostFDProvider)
+		if !ok {
+			return fmt.Errorf("%s must be a host regular file", name)
+		}
+		if err := specutils.ValidateStdioFileFD(hostFile.HostFD(), name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (l *Loader) releaseTemplateOutputs(ctx context.Context) {
+	for i, file := range l.templateOutputs {
+		if file != nil {
+			file.DecRef(ctx)
+			l.templateOutputs[i] = nil
+		}
+	}
+}
+
 // +checklocks:l.mu
 func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGroup, *host.TTYFileDescription, error) {
 	// Create the FD map, which will set stdin, stdout, and stderr.
@@ -1661,6 +1784,12 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	fdTable, ttyFile, err := createFDTable(ctx, info.spec.Process.Terminal, info.stdioFDs, info.passFDs, info.spec.Process.User, info.containerName)
 	if err != nil {
 		return nil, nil, fmt.Errorf("importing fds: %w", err)
+	}
+	if l.templateSandbox && info == &l.root {
+		if err := l.pinTemplateOutputs(fdTable); err != nil {
+			fdTable.DecRef(ctx)
+			return nil, nil, err
+		}
 	}
 	info.procArgs.StartupTimeline.Reached("FD table created")
 	// CreateProcess takes a reference on fdTable if successful. We won't need
@@ -2712,5 +2841,173 @@ func signalUnkillablePolicy(p config.SignalUnkillablePolicy) kernel.SignalUnkill
 		return kernel.SignalUnkillableNone
 	default:
 		return kernel.SignalUnkillableNone
+	}
+}
+
+// stop stops the controller and parks the guest before cloning.
+func (l *Loader) stop() {
+	l.ctrl.srv.Stop(0)
+	l.ctrl = nil
+	l.watchdog.Stop()
+	l.k.Pause()
+	l.k.Timekeeper().Pause()
+}
+
+func forkWatchdogOpts(conf *config.Config) (watchdog.Opts, error) {
+	opts := watchdog.DefaultOpts
+	if err := opts.TaskTimeoutAction.Set(conf.WatchdogAction); err != nil {
+		return watchdog.Opts{}, fmt.Errorf("setting watchdog action: %w", err)
+	}
+	opts.StartupTimeoutAction = watchdog.Panic
+	return opts, nil
+}
+
+// resetWatchdog gives the fork child its own startup timeout.
+func (l *Loader) resetWatchdog() error {
+	opts, err := forkWatchdogOpts(l.root.conf)
+	if err != nil {
+		return err
+	}
+	l.watchdog = watchdog.New(l.k, opts)
+	return nil
+}
+
+// updateForkMetadata updates the child identity and the spec environment
+// exposed to the application through /proc/gvisor/spec_environ.
+//
+// Preconditions: the sandbox contains one container and its tasks are paused.
+func (l *Loader) updateForkMetadata(id string, env []string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if p, ok := l.k.Platform.(interface{ SetSandboxID(string) }); ok {
+		p.SetSandboxID(id)
+	}
+	oldID := l.sandboxID
+	l.sandboxID = id
+	l.root.cid = id
+	l.root.procArgs.ContainerID = id
+	if env != nil {
+		l.root.spec.Process.Env = slices.Clone(env)
+	}
+
+	updatedContainerID := false
+	for name, cid := range l.containerIDs {
+		if cid == oldID {
+			l.containerIDs[name] = id
+			updatedContainerID = true
+		}
+	}
+	if !updatedContainerID && len(l.containerIDs) == 1 {
+		for name := range l.containerIDs {
+			l.containerIDs[name] = id
+		}
+	}
+	l.k.RestoreContainerMapping(l.containerIDs)
+
+	for _, task := range l.k.TaskSet().Root.Tasks() {
+		if task.ContainerID() == oldID {
+			task.RestoreContainerID(id)
+		}
+	}
+
+	processes := make(map[execID]*execProcess, len(l.processes))
+	for k, v := range l.processes {
+		k.cid = id
+		processes[k] = v
+	}
+	l.processes = processes
+}
+
+// serveTemplate runs in the seed until clone returns in a child, which serves
+// the accepted fork request.
+func (l *Loader) serveTemplate() {
+	select {
+	case <-l.templateCheckpoint:
+	case <-gtime.After(20 * gtime.Second):
+		log.Warningf("template: timed out waiting for a checkpoint request")
+		os.Exit(1)
+	}
+
+	srv := urpc.NewServer()
+	srv.Register(&SandboxTemplate{loader: l})
+
+	var seccompOpts filter.Options
+	if !l.root.conf.DisableSeccomp {
+		var err error
+		seccompOpts, err = l.seccompFilterOptions(l.ctrl.srv.FD())
+		if err != nil {
+			log.Warningf("failed to prepare seccomp options: %v", err)
+			os.Exit(1)
+		}
+	}
+
+	l.stop()
+
+	l.mu.Lock()
+	processCount := len(l.processes)
+	l.mu.Unlock()
+	if processCount != 1 {
+		log.Warningf("template requires one container, got %d", processCount)
+		os.Exit(1)
+	}
+
+	if !l.root.conf.DisableSeccomp {
+		program, err := filter.Precompile(seccompOpts)
+		if err != nil {
+			log.Warningf("failed to prepare seccomp program: %v", err)
+			os.Exit(1)
+		}
+		l.templateSeccompProgram = &program
+	}
+
+	if err := l.k.InvalidateMappings(); err != nil {
+		log.Warningf("failed to invalidate unsavable mappings: %v", err)
+		os.Exit(1)
+	}
+
+	l.k.Platform.Drop()
+
+	if err := unix.SetNonblock(l.templateServerFD, false); err != nil {
+		log.Warningf("failed to set template server socket blocking: %v", err)
+		os.Exit(1)
+	}
+
+	unix.CloseOnExec(l.templateServerFD)
+
+	if err := unix.Listen(l.templateServerFD, max(16, runtime.NumCPU())); err != nil {
+		log.Warningf("failed to listen on template server socket: %v", err)
+		os.Exit(1)
+	}
+
+	stubPath, stubFD, err := templatestub.PrepareMemfd()
+	if err != nil {
+		log.Warningf("failed to prepare template stub: %v", err)
+		os.Exit(1)
+	}
+
+	randomReader := rand.NewReader()
+	conn, err := unet.NewSocket(l.clone(stubPath, stubFD))
+	if err != nil {
+		log.Warningf("failed to create connection socket: %v", err)
+		os.Exit(1)
+	}
+
+	// Replace random state inherited from the template before the child resumes.
+	rand.UpdateReader(randomReader)
+	rootStack := l.k.RootNetworkNamespace().Stack()
+	netstackStack, ok := rootStack.(*netstack.Stack)
+	if !ok {
+		log.Warningf("template sandbox requires netstack, got %T", rootStack)
+		os.Exit(1)
+	}
+	netstackStack.Stack.ResetRandomState(randomReader)
+
+	if err, rpcErr := srv.ServeOne(conn); err != nil || rpcErr != nil {
+		if err == io.EOF && rpcErr == nil {
+			os.Exit(0)
+		}
+		log.Warningf("failed to handle RPC: %v, %v", err, rpcErr)
+		os.Exit(1)
 	}
 }

@@ -9,6 +9,7 @@ package(
 go_binary(
     name = "gvisor_sentry",
     srcs = ["sentry_main.go"],
+    gotags = ["gvisor_runtime_clone"],
     noasan = True,
     pure = True,
     visibility = ["//visibility:public"],
@@ -22,7 +23,10 @@ go_binary(
 go_binary(
     name = "gvisor_sentry-race",
     srcs = ["sentry_main.go"],
-    gotags = ["lockdep"],
+    gotags = [
+        "gvisor_runtime_clone",
+        "lockdep",
+    ],
     noasan = True,
     race = "on",
     static = True,
@@ -44,6 +48,7 @@ COVERAGE_SRCS = [
     "//:gopath",
     "//tools:build_cover.sh",
     "//tools:go-allow-internal.patch",
+    "//tools:go_support_clone.patch",
 ]
 
 COVERAGE_CMD = (
@@ -54,7 +59,8 @@ COVERAGE_CMD = (
     "\"$(execpath //:go.sum)\" " +
     "\"$(execpath sentry_main.go)\" " +
     "\"$(execpath //tools:go-allow-internal.patch)\" " +
-    "\"%s\" "
+    "\"%s\" " +
+    "\"$(execpath //tools:go_support_clone.patch)\" "
 )
 
 go_cov(
@@ -76,7 +82,10 @@ go_cov(
 go_binary(
     name = "gvisor_sentry_plugin_stack",
     srcs = ["sentry_main_plugin_stack.go"],
-    gotags = ["network_plugins"],
+    gotags = [
+        "gvisor_runtime_clone",
+        "network_plugins",
+    ],
     nogo = False,
     pure = False,
     static = True,

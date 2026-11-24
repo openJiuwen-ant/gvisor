@@ -1,0 +1,635 @@
+diff --git a/src/runtime/defs_linux_amd64.go b/src/runtime/defs_linux_amd64.go
+--- a/src/runtime/defs_linux_amd64.go
++++ b/src/runtime/defs_linux_amd64.go
+@@ -7,6 +7,7 @@
+ 
+ const (
+ 	_EINTR  = 0x4
++	_ECHILD = 0xa
+ 	_EAGAIN = 0xb
+ 	_ENOMEM = 0xc
+ 	_ENOSYS = 0x26
+@@ -93,6 +94,14 @@
+ 
+ 	_AF_UNIX    = 0x1
+ 	_SOCK_DGRAM = 0x2
++
++	_SYS_CLOSE        = 3
++	_SYS_RT_SIGACTION = 13
++	_SYS_GETPID       = 39
++	_SYS_CLONE        = 56
++	_SYS_WAIT4        = 61
++	_SYS_EXIT_GROUP   = 231
++	_SYS_TGKILL       = 234
+ )
+ 
+ type timespec struct {
+diff --git a/src/runtime/defs_linux_arm64.go b/src/runtime/defs_linux_arm64.go
+--- a/src/runtime/defs_linux_arm64.go
++++ b/src/runtime/defs_linux_arm64.go
+@@ -7,6 +7,7 @@
+ 
+ const (
+ 	_EINTR  = 0x4
++	_ECHILD = 0xa
+ 	_EAGAIN = 0xb
+ 	_ENOMEM = 0xc
+ 	_ENOSYS = 0x26
+@@ -93,6 +94,15 @@
+ 
+ 	_AF_UNIX    = 0x1
+ 	_SOCK_DGRAM = 0x2
++
++	_SYS_CLOSE        = 57
++	_SYS_RT_SIGACTION = 134
++	_SYS_GETPID       = 172
++	_SYS_CLONE        = 220
++	_SYS_WAIT4        = 260
++	_SYS_GETTIMEOFDAY = 169
++	_SYS_EXIT_GROUP   = 94
++	_SYS_TGKILL       = 131
+ )
+ 
+ type timespec struct {
+diff --git a/src/runtime/netpoll_epoll.go b/src/runtime/netpoll_epoll.go
+--- a/src/runtime/netpoll_epoll.go
++++ b/src/runtime/netpoll_epoll.go
+@@ -14,6 +14,7 @@
+ 
+ var (
+ 	epfd           int32         = -1 // epoll descriptor
++	nfds           uint32             // number of fds registered in epoll
+ 	netpollEventFd uintptr            // eventfd for netpollBreak
+ 	netpollWakeSig atomic.Uint32      // used to avoid duplicate calls of netpollBreak
+ )
+@@ -65,12 +66,37 @@
+ 	var ev linux.EpollEvent
+ 	ev.Events = linux.EPOLLIN | linux.EPOLLOUT | linux.EPOLLRDHUP | linux.EPOLLET
+ 	netpollPackData(&ev, pd, pd.fdseq.Load())
+-	return linux.EpollCtl(epfd, linux.EPOLL_CTL_ADD, int32(fd), &ev)
++	errno := linux.EpollCtl(epfd, linux.EPOLL_CTL_ADD, int32(fd), &ev)
++	if errno == 0 {
++		atomic.Xadd(&nfds, 1)
++	}
++	return errno
+ }
+ 
+ func netpollclose(fd uintptr) uintptr {
+ 	var ev linux.EpollEvent
++	atomic.Xadd(&nfds, -1)
+ 	return linux.EpollCtl(epfd, linux.EPOLL_CTL_DEL, int32(fd), &ev)
++}
++
++//go:nosplit
++func netpollstop() bool {
++	if !netpollinited() {
++		return true
++	}
++	if atomic.Load(&nfds) != 0 {
++		return false
++	}
++	if netpollEventFd != 0 {
++		_close(int(netpollEventFd))
++		netpollEventFd = 0
++	}
++	if epfd >= 0 {
++		_close(int(epfd))
++		epfd = -1
++	}
++	netpollInited.Store(0)
++	return true
+ }
+ 
+ func netpollarm(pd *pollDesc, mode int) {
+@@ -139,6 +165,10 @@
+ 		// If a timed sleep was interrupted, just return to
+ 		// recalculate how long we should sleep now.
+ 		if waitms > 0 {
++			return gList{}, 0
++		}
++		// break the loop during sandbox clone
++		if stopsysm.Load() && netpollWaiters.Load() == 0 {
+ 			return gList{}, 0
+ 		}
+ 		goto retry
+diff --git a/src/runtime/proc.go b/src/runtime/proc.go
+--- a/src/runtime/proc.go
++++ b/src/runtime/proc.go
+@@ -14,6 +14,7 @@
+ 	"internal/runtime/exithook"
+ 	"internal/runtime/maps"
+ 	"internal/runtime/sys"
++	"internal/runtime/syscall/linux"
+ 	"internal/strconv"
+ 	"internal/stringslite"
+ 	"unsafe"
+@@ -148,6 +149,48 @@
+ 
+ // Value to use for signal mask for newly created M's.
+ var initSigmask sigset
++
++//go:nosplit
++func _getpid() int {
++	pid, _, _ := linux.Syscall6(_SYS_GETPID, 0, 0, 0, 0, 0, 0)
++	return int(pid)
++}
++
++//go:nosplit
++func _exit_group(status int) {
++	linux.Syscall6(_SYS_EXIT_GROUP, uintptr(status), 0, 0, 0, 0, 0)
++}
++
++//go:nosplit
++func _wait(pid int) int {
++	_, _, errno := linux.Syscall6(_SYS_WAIT4, uintptr(pid), 0, 0, 0, 0, 0)
++	return int(errno)
++}
++
++//go:nosplit
++func _tgkill(tgid, tid, sig int) int {
++	_, _, errno := linux.Syscall6(_SYS_TGKILL, uintptr(tgid), uintptr(tid), uintptr(sig), 0, 0, 0)
++	return int(errno)
++}
++
++//go:nosplit
++func _sigaction(signum int, sa, oldsa uintptr) int {
++	const maskLen = 8
++	_, _, errno := linux.Syscall6(_SYS_RT_SIGACTION, uintptr(signum), sa, oldsa, maskLen, 0, 0)
++	return int(errno)
++}
++
++//go:nosplit
++func _clone(flags int) (int, int) {
++	pid, _, errno := linux.Syscall6(_SYS_CLONE, uintptr(flags), 0, 0, 0, 0, 0)
++	return int(pid), int(errno)
++}
++
++//go:nosplit
++func _close(fd int) int {
++	_, _, errno := linux.Syscall6(_SYS_CLOSE, uintptr(fd), 0, 0, 0, 0, 0)
++	return int(errno)
++}
+ 
+ // The main goroutine.
+ func main() {
+@@ -1478,6 +1521,7 @@
+ 	stwForTestReadMemStatsSlow                      // "ReadMemStatsSlow (test)"
+ 	stwForTestPageCachePagesLeaked                  // "PageCachePagesLeaked (test)"
+ 	stwForTestResetDebugLog                         // "ResetDebugLog (test)"
++	stwForClone                                     // "runtime.Clone"
+ )
+ 
+ func (r stwReason) String() string {
+@@ -1509,6 +1553,7 @@
+ 	stwForTestReadMemStatsSlow:     "ReadMemStatsSlow (test)",
+ 	stwForTestPageCachePagesLeaked: "PageCachePagesLeaked (test)",
+ 	stwForTestResetDebugLog:        "ResetDebugLog (test)",
++	stwForClone:                    "runtime.Clone",
+ }
+ 
+ // worldStop provides context from the stop-the-world required by the
+@@ -1965,7 +2010,7 @@
+ 	// Create an extra M for callbacks on threads not created by Go.
+ 	// An extra M is also needed on Windows for callbacks created by
+ 	// syscall.NewCallback. See issue #6751 for details.
+-	if (iscgo || GOOS == "windows") && !cgoHasExtraM {
++	if (iscgo || GOOS == "windows") && !cgoHasExtraM && debug.runtimeclone == 0 {
+ 		cgoHasExtraM = true
+ 		newextram()
+ 	}
+@@ -2976,6 +3021,8 @@
+ //
+ //go:nowritebarrierrec
+ func templateThread() {
++	templateM = uintptr(unsafe.Pointer(getg().m))
++
+ 	lock(&sched.lock)
+ 	sched.nmsys++
+ 	checkdead()
+@@ -2999,6 +3046,9 @@
+ 		noteclear(&newmHandoff.wake)
+ 		unlock(&newmHandoff.lock)
+ 		notesleep(&newmHandoff.wake)
++		if stopsysm.Load() {
++			exitsysm()
++		}
+ 	}
+ }
+ 
+@@ -6531,10 +6581,19 @@
+ // No threads on wasm yet, so no sysmon.
+ const haveSysmon = GOARCH != "wasm"
+ 
++var (
++	stopsysm atomic.Bool
++
++	sysmonM   uintptr
++	templateM uintptr
++)
++
+ // Always runs without a P, so write barriers are not allowed.
+ //
+ //go:nowritebarrierrec
+ func sysmon() {
++	sysmonM = uintptr(unsafe.Pointer(getg().m))
++
+ 	lock(&sched.lock)
+ 	sched.nmsys++
+ 	checkdead()
+@@ -6604,6 +6663,10 @@
+ 				}
+ 			}
+ 			unlock(&sched.lock)
++		}
++
++		if stopsysm.Load() {
++			exitsysm()
+ 		}
+ 
+ 		lock(&sched.sysmonlock)
+@@ -8097,6 +8160,267 @@
+ 	return a
+ }
+ 
++//go:nowritebarrierrec
++//go:nosplit
++func exitsysm() {
++	lock(&sched.lock)
++	sched.nmsys--
++	sched.nmfreed++
++	unlock(&sched.lock)
++	for {
++		usleep(1000 * 1000 * 1000)
++	}
++}
++
++var _m0_ *m
++
++//go:nosplit
++func savem0() {
++	// The new m0 will be removed from the global list after clone.
++	// We need to hold a reference to prevent GC reclaiming it.
++	_m0_ = getg().m
++}
++
++//go:nosplit
++//go:nowritebarrierrec
++func parkm0(gp *g) {
++	_g_ := getg()
++	if _g_.m != _m0_ {
++		println("clone isn't running on m0, expected:", _m0_, "got:", _g_.m)
++		throw("m is changed")
++	}
++	casgstatus(gp, _Grunning, _Grunnable)
++	dropg()
++	runqput(_g_.m.p.ptr(), gp, true)
++	handoffp(releasep())
++	// handoffp may allocate memory, which platforms can service through
++	// SIGSYS mmap traps. Block signals only after handing off the P.
++	sigprocmask(_SIG_SETMASK, &sigset_all, nil)
++	for {
++		notesleep(&_g_.m.park)
++		usleep(2000 * 1000 * 1000)
++	}
++}
++
++//go:nosplit
++func reclaimMs() {
++	// Give other Ms time to park before checking scheduler state again.
++	const pollIntervalUs = 100
++
++	_g_ := getg()
++
++	stopsysm.Store(true)
++
++	wakeSignalWatcher()
++
++	lock(&sched.lock)
++
++	// Reclaim sys Ms, e.g. sysmon and template thread.
++	for sched.nmsys > 0 {
++		if sched.sysmonwait.Load() {
++			sched.sysmonwait.Store(false)
++			notewakeup(&sched.sysmonnote)
++		}
++		unlock(&sched.lock)
++
++		lock(&newmHandoff.lock)
++		if newmHandoff.waiting {
++			newmHandoff.waiting = false
++			notewakeup(&newmHandoff.wake)
++		}
++		unlock(&newmHandoff.lock)
++
++		usleep(pollIntervalUs)
++		lock(&sched.lock)
++	}
++
++	for pprev := &allm; *pprev != nil; {
++		sysmon := (*m)(unsafe.Pointer(sysmonM))
++		template := (*m)(unsafe.Pointer(templateM))
++		if *pprev == sysmon || *pprev == template {
++			*pprev = (*pprev).alllink
++		} else if *pprev == _m0_ {
++			// The old m0 was parked by parkm0 after clone and is
++			// never reused. Drop it from allm and account it freed
++			// so the reclaim loop below neither tgkills it nor spins
++			// forever on mcount() > 1. Leaving m0 on allm lets the
++			// forked sandbox exit silently mid-setup.
++			*pprev = (*pprev).alllink
++			sched.nmfreed++
++		} else {
++			pprev = &(*pprev).alllink
++		}
++	}
++
++	// Reclaim remaining Ms.
++	pid := _getpid()
++	for mcount() > 1 {
++		for {
++			mp := mget()
++			if mp == nil {
++				break
++			}
++			for pprev := &allm; *pprev != nil; pprev = &(*pprev).alllink {
++				if *pprev == mp {
++					*pprev = mp.alllink
++					break
++				}
++			}
++			sched.nmfreed++
++		}
++
++		for mp := allm; mp != nil; mp = mp.alllink {
++			if mp == _g_.m {
++				continue
++			}
++			_tgkill(pid, int(mp.procid), _SIGCHLD)
++		}
++
++		unlock(&sched.lock)
++		usleep(pollIntervalUs)
++		lock(&sched.lock)
++	}
++	unlock(&sched.lock)
++}
++
++//go:nosplit
++func checkMs() {
++	if mcount() != 1 || sched.nmsys != 0 || sched.nmidle != 0 || sched.nmidlelocked != 0 || extraMLength.Load() != 0 {
++		println("mcount():", mcount(), "nmsys:", sched.nmsys, "nmidle:", sched.nmidle, "nmidlelocked:", sched.nmidlelocked, "extraMLength:", extraMLength.Load())
++		panic("unexpected number of Ms")
++	}
++}
++
++func Clone(preclone func(int), waiting func() bool, postclone func(int), flags, workers int, ready func()) {
++	if workers < 1 {
++		panic("runtime clone requires at least one template worker")
++	}
++	if debug.runtimeclone == 0 {
++		panic("runtime clone support isn't enabled")
++	}
++
++	if GOOS != "linux" {
++		panic("runtime clone is only supported on linux")
++	}
++
++	_g_ := getg()
++
++	GC()
++
++	stopSigM()
++	w := stopTheWorld(stwForClone)
++	reclaimMs()
++
++	if !netpollstop() {
++		panic("netpoll still in use")
++	}
++
++	if pid, errno := _clone(flags); errno != 0 {
++		println("clone errno:", errno)
++		panic(errno)
++	} else {
++		lockOSThread()
++		_g_.m.procid = uint64(gettid())
++		if preclone != nil {
++			preclone(pid)
++		}
++		if pid != 0 {
++			errno := _wait(pid)
++			for errno == _EINTR {
++				errno = _wait(pid)
++			}
++			if errno != 0 && errno != _ECHILD {
++				_exit_group(1)
++			}
++			_exit_group(0)
++		}
++	}
++
++	// Keep the initialized seed stopped and fork independent accept loops.
++	// A worker exit terminates the seed, whose PID namespace owns the pool.
++	seed := true
++	for i := 0; i < workers; i++ {
++		pid, errno := _clone(flags)
++		if errno != 0 {
++			_exit_group(1)
++		}
++		if pid == 0 {
++			_g_.m.procid = uint64(gettid())
++			seed = false
++			break
++		}
++	}
++	if seed {
++		if ready != nil {
++			ready()
++		}
++		for _wait(-1) == _EINTR {
++		}
++		_exit_group(1)
++	}
++
++	var sa, oldsa struct {
++		handler  uintptr
++		flags    uint64
++		restorer uintptr
++		mask     uint64
++	}
++
++	sa.handler = _SIG_IGN
++	if errno := _sigaction(_SIGCHLD, uintptr(unsafe.Pointer(&sa)), uintptr(unsafe.Pointer(&oldsa))); errno != 0 {
++		println("sigaction errno:", errno)
++		panic(errno)
++	}
++
++	checkMs()
++
++	for waiting() {
++		if pid, errno := _clone(flags); errno != 0 {
++			println("clone errno:", errno)
++			panic(errno)
++		} else {
++			if pid == 0 {
++				_g_.m.procid = uint64(gettid())
++			}
++			if postclone != nil {
++				postclone(pid)
++			}
++			if pid == 0 {
++				break
++			}
++		}
++	}
++
++	if errno := _sigaction(_SIGCHLD, uintptr(unsafe.Pointer(&oldsa)), 0); errno != 0 {
++		println("sigaction errno:", errno)
++		panic(errno)
++	}
++
++	netpollGenericInit()
++
++	stopsysm.Store(false)
++	if atomic.Cas(&newmHandoff.haveTemplateThread, 1, 0) {
++		startTemplateThread()
++	}
++
++	if iscgo {
++		cgoHasExtraM = true
++		systemstack(newextram)
++	}
++
++	// Start the periodic GC interval when the child resumes, regardless of seed age.
++	atomic.Store64(&memstats.last_gc_nanotime, uint64(nanotime()))
++	systemstack(func() {
++		newm(sysmon, nil, -1)
++	})
++
++	startTheWorld(w)
++	_ensureSigM()
++	savem0()
++	unlockOSThread()
++	mcall(parkm0)
++}
++
+ // An initTask represents the set of initializations that need to be done for a package.
+ // Keep in sync with ../../test/noinit.go:initTask
+ type initTask struct {
+diff --git a/src/runtime/runtime1.go b/src/runtime/runtime1.go
+--- a/src/runtime/runtime1.go
++++ b/src/runtime/runtime1.go
+@@ -352,6 +352,8 @@
+ 	// tracebacklabels controls the inclusion of goroutine labels in the
+ 	// goroutine status header line.
+ 	tracebacklabels atomic.Int32
++
++	runtimeclone int32
+ }
+ 
+ var dbgvars = []*dbgVar{
+@@ -388,6 +390,7 @@
+ 	{name: "tracebacklabels", atomic: &debug.tracebacklabels, def: 1},
+ 	{name: "tracefpunwindoff", value: &debug.tracefpunwindoff},
+ 	{name: "updatemaxprocs", value: &debug.updatemaxprocs, def: 1},
++	{name: "runtimeclone", value: &debug.runtimeclone},
+ }
+ 
+ func parseRuntimeDebugVars(godebug string) {
+diff --git a/src/runtime/signal_unix.go b/src/runtime/signal_unix.go
+--- a/src/runtime/signal_unix.go
++++ b/src/runtime/signal_unix.go
+@@ -94,6 +94,10 @@
+ 	disableSigChan  chan uint32
+ 	enableSigChan   chan uint32
+ 	maskUpdatedChan chan struct{}
++	stopSigMChan    chan struct{}
++	sigMStoppedChan chan struct{}
++
++	sigBlocked = sigset_all
+ )
+ 
+ func init() {
+@@ -1073,6 +1077,8 @@
+ 	maskUpdatedChan = make(chan struct{})
+ 	disableSigChan = make(chan uint32)
+ 	enableSigChan = make(chan uint32)
++	stopSigMChan = make(chan struct{})
++	sigMStoppedChan = make(chan struct{})
+ 	go func() {
+ 		// Signal masks are per-thread, so make sure this goroutine stays on one
+ 		// thread.
+@@ -1082,12 +1088,41 @@
+ 		// initially all signals except the essential. When signal.Notify()/Stop is called,
+ 		// sigenable/sigdisable in turn notify this thread to update its signal
+ 		// mask accordingly.
+-		sigBlocked := sigset_all
++		sigBlocked = sigset_all
+ 		for i := range sigtable {
+ 			if !blockableSig(uint32(i)) {
+ 				sigdelset(&sigBlocked, i)
+ 			}
+ 		}
++		sigprocmask(_SIG_SETMASK, &sigBlocked, nil)
++	loop:
++		for {
++			select {
++			case sig := <-enableSigChan:
++				if sig > 0 {
++					sigdelset(&sigBlocked, int(sig))
++				}
++			case sig := <-disableSigChan:
++				if sig > 0 && blockableSig(sig) {
++					sigaddset(&sigBlocked, int(sig))
++				}
++			case <-stopSigMChan:
++				sigMStoppedChan <- struct{}{}
++				break loop
++			}
++			sigprocmask(_SIG_SETMASK, &sigBlocked, nil)
++			maskUpdatedChan <- struct{}{}
++		}
++	}()
++}
++
++//go:nosplit
++func _ensureSigM() {
++	go func() {
++		// Signal masks are per-thread, so make sure this goroutine stays on one
++		// thread.
++		LockOSThread()
++		defer UnlockOSThread()
+ 		sigprocmask(_SIG_SETMASK, &sigBlocked, nil)
+ 		for {
+ 			select {
+@@ -1104,6 +1139,12 @@
+ 			maskUpdatedChan <- struct{}{}
+ 		}
+ 	}()
++}
++
++//go:nosplit
++func stopSigM() {
++	stopSigMChan <- struct{}{}
++	<-sigMStoppedChan
+ }
+ 
+ // This is called when we receive a signal when there is no signal stack.
+diff --git a/src/runtime/sigqueue.go b/src/runtime/sigqueue.go
+--- a/src/runtime/sigqueue.go
++++ b/src/runtime/sigqueue.go
+@@ -167,6 +167,15 @@
+ 	}
+ }
+ 
++// Wake up the signal receiver goroutine to reclaim M. It does so only
++// when the signal receiver goroutine is in the sigReceiving state, which
++// indicates that the goroutine is sleeping and needs to be woken up.
++func wakeSignalWatcher() {
++	if sig.state.CompareAndSwap(sigReceiving, sigIdle) {
++		notewakeup(&sig.note)
++	}
++}
++
+ // signalWaitUntilIdle waits until the signal delivery mechanism is idle.
+ // This is used to ensure that we do not drop a signal notification due
+ // to a race between disabling a signal and receiving a signal.

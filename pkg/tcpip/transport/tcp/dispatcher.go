@@ -420,6 +420,11 @@ func (d *dispatcher) init(rng *rand.Rand, nProcessors int) {
 	d.startLocked()
 }
 
+// Preconditions: Packet delivery through d must be paused.
+func (d *dispatcher) resetRandomState(rng *rand.Rand) {
+	d.hasher.seed = rng.Uint32()
+}
+
 // +checklocks:d.mu
 func (d *dispatcher) startLocked() {
 	if d.closed {

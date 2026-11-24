@@ -17,6 +17,9 @@
 package pgalloc
 
 import (
+	"bytes"
+	"fmt"
+	"os"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -582,6 +585,64 @@ func TestFindAllocatable(t *testing.T) {
 			if wantEnd := test.want + test.length; fr.End != wantEnd {
 				t.Errorf("findAllocatableAndMarkUsed(%+v): got: end=%#x, want: %#x\n%v", alloc, fr.End, wantEnd, f)
 			}
+		})
+	}
+}
+
+func TestPrivateAnonymousCommitAndUsage(t *testing.T) {
+	for _, mode := range []AllocationMode{AllocateAndCommit, AllocateCallerIndirectCommit} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			file, err := os.CreateTemp(t.TempDir(), "memory")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			mf, err := NewMemoryFile(file, MemoryFileOpts{
+				PrivateAnonymousMapping: true,
+				DisableMemoryAccounting: true,
+				DisableIMAWorkAround:    true,
+				DelayedEviction:         DelayedEvictionDisabled,
+			})
+			if err != nil {
+				file.Close()
+				t.Fatal(err)
+			}
+			defer mf.Destroy()
+
+			fr, err := mf.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mf.DecRef(fr)
+			if mode == AllocateCallerIndirectCommit {
+				mf.forEachMappingSlice(fr, func(b []byte) {
+					for i := 0; i < len(b); i += int(hostarch.PageSize) {
+						b[i] = 1
+					}
+				})
+			}
+
+			if got, err := mf.TotalUsage(); err != nil || got < fr.Length() {
+				t.Fatalf("TotalUsage = %d, %v; want at least %d", got, err, fr.Length())
+			}
+
+			st, err := file.Stat()
+			if err != nil || st.Size() != 0 {
+				t.Fatalf("anonymous allocation grew its identity file: %v, %v", st, err)
+			}
+			if _, err := mf.DataFD(fr); err == nil {
+				t.Fatal("DataFD exposed a file without allocation contents")
+			}
+
+			mf.forEachMappingSlice(fr, func(b []byte) { copy(b, bytes.Repeat([]byte{0xa5}, len(b))) })
+			if err := mf.decommitFile(fr); err != nil {
+				t.Fatal(err)
+			}
+			mf.forEachMappingSlice(fr, func(b []byte) {
+				if !bytes.Equal(b, make([]byte, len(b))) {
+					t.Error("decommitted memory did not read as zero")
+				}
+			})
 		})
 	}
 }

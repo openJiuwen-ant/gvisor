@@ -21,6 +21,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/seccomp"
+	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
 	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/runsc/boot/filter/config"
 )
@@ -39,9 +40,7 @@ type Options = config.Options
 // timer, if non-nil, is used to record the duration of the individual steps
 // of filter installation. It may be nil.
 func Install(opt Options, timer *timing.Timer) error {
-	for _, warning := range config.Warnings(opt) {
-		log.Warningf("*** SECCOMP WARNING: %s", warning)
-	}
+	logWarnings(opt)
 	key := opt.ConfigKey()
 	precompiled, usePrecompiled := GetPrecompiled(key)
 	if usePrecompiled && !debugFilter {
@@ -83,4 +82,32 @@ func Install(opt Options, timer *timing.Timer) error {
 		Options: seccompOpts,
 	}
 	return program.Install(timer)
+}
+
+// Precompile prepares a filter whose runtime variables can be filled after fork.
+func Precompile(opt Options) (precompiledseccomp.Program, error) {
+	if program, ok := GetPrecompiled(opt.ConfigKey()); ok {
+		return program, nil
+	}
+	return config.Precompile(opt)
+}
+
+// InstallPrecompiled installs a prepared program using the current process's
+// variables, including its PID and donated controller FD.
+func InstallPrecompiled(opt Options, program precompiledseccomp.Program) error {
+	if program.Name != opt.ConfigKey() {
+		return fmt.Errorf("prepared seccomp program %q does not match config %q", program.Name, opt.ConfigKey())
+	}
+	instructions, err := program.RenderInstructions(opt.Vars())
+	if err != nil {
+		return fmt.Errorf("rendering prepared seccomp program: %w", err)
+	}
+	logWarnings(opt)
+	return seccomp.SetFilter(instructions)
+}
+
+func logWarnings(opt Options) {
+	for _, warning := range config.Warnings(opt) {
+		log.Warningf("*** SECCOMP WARNING: %s", warning)
+	}
 }

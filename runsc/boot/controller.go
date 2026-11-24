@@ -18,8 +18,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strconv"
+	"strings"
 	"sync"
 	gtime "time"
 
@@ -643,7 +645,7 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	}
 
 	// Create the main MemoryFile.
-	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP, false /* privateAnonymousMapping */)
 	if err != nil {
 		return fmt.Errorf("creating memory file: %v", err)
 	}
@@ -917,12 +919,22 @@ func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) (r
 
 // Pause pauses all tasks, blocking until they are stopped.
 func (cm *containerManager) Pause(_, _ *struct{}) error {
+	cm.l.mu.Lock()
+	defer cm.l.mu.Unlock()
+	if cm.l.templateSandbox {
+		return fmt.Errorf("sandbox template cannot be paused through the controller")
+	}
 	cm.l.k.Pause()
 	return nil
 }
 
 // Resume resumes all tasks.
 func (cm *containerManager) Resume(_, _ *struct{}) error {
+	cm.l.mu.Lock()
+	defer cm.l.mu.Unlock()
+	if cm.l.templateSandbox {
+		return fmt.Errorf("sandbox template cannot be resumed")
+	}
 	cm.l.k.Unpause()
 	return control.PostResume(cm.l.k, nil)
 }
@@ -1264,26 +1276,9 @@ func (cm *containerManager) GetSavings(_ *struct{}, s *Savings) error {
 	return nil
 }
 
-// SetNetworkArgs sets the network arguments. It configures host sockets
-// (packet fanout groups) before seccomp is installed, but does not create
-// the netstack links and routes.
-func (cm *containerManager) SetNetworkArgs(args *CreateLinksAndRoutesArgs, _ *struct{}) error {
-	log.Debugf("containerManager.SetNetworkArgs")
-	if args == nil {
-		return fmt.Errorf("cannot set nil networkArgs")
-	}
-
-	cm.l.mu.Lock()
-	state := cm.l.state
-	cm.l.mu.Unlock()
-	if state == started || state == restored || state == restoringStarted {
-		log.Warningf("SetNetworkArgs called after sandbox started (state=%s), ignoring", state)
-		return nil
-	}
-
-	// Create a new CreateLinksAndRoutesArgs variable to store in the loader
-	// as the FDs associated with the original argument passed to this urpc
-	// will be closed when it returns.
+// +checklocks:cm.l.mu
+func (cm *containerManager) setNetworkArgs(args *CreateLinksAndRoutesArgs) error {
+	// Copy the arguments and FDs because the RPC closes its FDs on return.
 	networkArgs := *args
 	dupedFDs, err := fd.NewFromFiles(args.FilePayload.Files)
 	if err != nil {
@@ -1344,10 +1339,30 @@ func (cm *containerManager) SetNetworkArgs(args *CreateLinksAndRoutesArgs, _ *st
 	networkArgs.FilePayload.Files = fd.ReleaseToFiles(dupedFDs, "network-fd")
 	c.Release()
 
-	cm.l.mu.Lock()
+	if cm.l.networkArgs != nil {
+		for _, f := range cm.l.networkArgs.FilePayload.Files {
+			f.Close()
+		}
+	}
 	cm.l.networkArgs = &networkArgs
-	cm.l.mu.Unlock()
 	return nil
+}
+
+// SetNetworkArgs sets the network arguments without creating links and routes.
+func (cm *containerManager) SetNetworkArgs(args *CreateLinksAndRoutesArgs, _ *struct{}) error {
+	log.Debugf("containerManager.SetNetworkArgs")
+	if args == nil {
+		return fmt.Errorf("cannot set nil networkArgs")
+	}
+
+	cm.l.mu.Lock()
+	defer cm.l.mu.Unlock()
+	state := cm.l.state
+	if state == started || state == restored || state == restoringStarted {
+		log.Warningf("SetNetworkArgs called after sandbox started (state=%s), ignoring", state)
+		return nil
+	}
+	return cm.setNetworkArgs(args)
 }
 
 // GetNetworkConfig returns the network interfaces and routes.
@@ -1362,5 +1377,214 @@ func (cm *containerManager) GetNetworkConfig(_ *struct{}, networkArgs *CreateLin
 	if networkArgs == nil {
 		log.Debugf("networks args is nil")
 	}
+	return nil
+}
+
+// StartForked configures networking and seccomp before releasing the workload.
+func (cm *containerManager) StartForked(args *CreateLinksAndRoutesArgs, _ *struct{}) error {
+	cm.l.mu.Lock()
+	defer cm.l.mu.Unlock()
+	if !cm.l.templateSandbox || cm.l.state != started {
+		return fmt.Errorf("sandbox is not awaiting fork startup")
+	}
+	if args == nil {
+		return fmt.Errorf("fork startup requires explicit network arguments")
+	}
+	if cm.l.networkArgs != nil {
+		return fmt.Errorf("fork startup has already been attempted")
+	}
+	stack := cm.l.k.RootNetworkNamespace().Stack()
+	if _, ok := stack.(*netstack.Stack); !ok {
+		return fmt.Errorf("fork startup requires netstack, got %T", stack)
+	}
+	if cm.l.root.conf.DisableSeccomp {
+		return fmt.Errorf("fork startup requires Sentry seccomp")
+	}
+
+	if err := cm.setNetworkArgs(args); err != nil {
+		return err
+	}
+	if err := cm.l.ConfigureNetwork(stack); err != nil {
+		return fmt.Errorf("configuring fork network: %w", err)
+	}
+	if err := cm.l.installSeccompFilters(); err != nil {
+		return err
+	}
+
+	cm.l.watchdog.Start()
+	// Let the checkpoint read return "restore" when guest tasks resume.
+	cm.l.k.IncCheckpointGenOnRestore()
+	cm.l.k.Unpause()
+	cm.l.templateSandbox = false
+	return nil
+}
+
+// SandboxTemplate is the urpc receiver registered on a template sandbox's
+// template socket. A template can serve multiple Fork RPCs, producing one
+// forked child sandbox per call.
+type SandboxTemplate struct {
+	loader *Loader
+}
+
+// validateTemplateForkArgs checks the donation before the child changes state.
+func validateTemplateForkArgs(args *TemplateForkArgs) (map[string]*os.File, error) {
+	if args == nil || args.ID == "" {
+		return nil, fmt.Errorf("fork requires a container ID")
+	}
+	for _, entry := range args.Env {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok || name == "" || strings.ContainsRune(entry, '\x00') {
+			return nil, fmt.Errorf("invalid fork environment entry %q", entry)
+		}
+	}
+
+	requiredFiles := [...]struct {
+		index int
+		name  string
+		kind  uint32
+	}{
+		{args.UserStdoutFileIndex, "stdout", unix.S_IFREG},
+		{args.UserStderrFileIndex, "stderr", unix.S_IFREG},
+		{args.UrpcServerFileIndex, "control socket", unix.S_IFSOCK},
+		{args.DeviceFileIndex, "platform device", unix.S_IFCHR},
+	}
+	if want := len(requiredFiles) + len(args.BackendFileInfo); len(args.Files) != want {
+		return nil, fmt.Errorf("fork received %d files, want %d", len(args.Files), want)
+	}
+
+	used := make(map[int]bool)
+	for _, item := range requiredFiles {
+		file, err := templateFile(args.Files, item.index, item.name)
+		if err != nil {
+			return nil, err
+		}
+		if used[item.index] {
+			return nil, fmt.Errorf("duplicate fork file index %d", item.index)
+		}
+		used[item.index] = true
+		if item.kind == unix.S_IFREG {
+			if err := specutils.ValidateStdioFile(file, item.name); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		var st unix.Stat_t
+		if err := unix.Fstat(int(file.Fd()), &st); err != nil {
+			return nil, fmt.Errorf("stat %s: %w", item.name, err)
+		}
+		if st.Mode&unix.S_IFMT != item.kind {
+			return nil, fmt.Errorf("invalid fork %s file type", item.name)
+		}
+	}
+
+	sockFD := int(args.Files[args.UrpcServerFileIndex].Fd())
+	if domain, err := unix.GetsockoptInt(sockFD, unix.SOL_SOCKET, unix.SO_DOMAIN); err != nil || domain != unix.AF_UNIX {
+		return nil, fmt.Errorf("fork control socket must be a Unix socket")
+	}
+	if kind, err := unix.GetsockoptInt(sockFD, unix.SOL_SOCKET, unix.SO_TYPE); err != nil || kind != unix.SOCK_STREAM {
+		return nil, fmt.Errorf("fork control socket must be a stream socket")
+	}
+
+	for _, info := range args.BackendFileInfo {
+		if used[info.FilestoreIndex] {
+			return nil, fmt.Errorf("duplicate fork file index %d", info.FilestoreIndex)
+		}
+		used[info.FilestoreIndex] = true
+	}
+	return templateBackendFiles(args.Files, args.BackendFileInfo)
+}
+
+func templateFile(files []*os.File, index int, name string) (*os.File, error) {
+	if index < 0 || index >= len(files) {
+		return nil, fmt.Errorf("%s index %d out of range, got %d files", name, index, len(files))
+	}
+	if files[index] == nil {
+		return nil, fmt.Errorf("%s file is nil", name)
+	}
+	return files[index], nil
+}
+
+func templateBackendFiles(files []*os.File, infos []BackendFileInfo) (map[string]*os.File, error) {
+	if len(infos) == 0 {
+		return nil, nil
+	}
+
+	backendFiles := make(map[string]*os.File, len(infos))
+	for _, info := range infos {
+		if info.MountPoint == "" {
+			return nil, fmt.Errorf("backend file mount point is empty")
+		}
+		if _, exists := backendFiles[info.MountPoint]; exists {
+			return nil, fmt.Errorf("duplicate backend file for mount point %q", info.MountPoint)
+		}
+		file, err := templateFile(files, info.FilestoreIndex, "backend file")
+		if err != nil {
+			return nil, fmt.Errorf("backend file for mount point %q: %w", info.MountPoint, err)
+		}
+		backendFiles[info.MountPoint] = file
+	}
+	return backendFiles, nil
+}
+
+// Fork initializes an already-cloned child with donated resources. It rebuilds
+// the controller, platform, and clocks while the kernel remains paused.
+// containerManager.StartForked completes setup before guest execution resumes.
+func (sc *SandboxTemplate) Fork(args *TemplateForkArgs, _ *TemplateForkResult) error {
+	backendFiles, err := validateTemplateForkArgs(args)
+	if err != nil {
+		return err
+	}
+	files := args.Files
+	l := sc.loader
+	if err := l.k.UpdateMemoryFileFilestore(backendFiles); err != nil {
+		return fmt.Errorf("updating memory file filestore: %w", err)
+	}
+
+	if err := l.resetWatchdog(); err != nil {
+		return err
+	}
+	l.updateForkMetadata(args.ID, args.Env)
+
+	for i, index := range [...]int{args.UserStdoutFileIndex, args.UserStderrFileIndex} {
+		target := l.templateOutputs[i].Impl().(vfs.HostFDProvider).HostFD()
+		if err := unix.Dup2(int(files[index].Fd()), target); err != nil {
+			return fmt.Errorf("replacing output FD %d: %w", i+1, err)
+		}
+	}
+	l.releaseTemplateOutputs(l.k.SupervisorContext())
+
+	// The RPC owns the donated control socket.
+	ctrlFileFD := int(files[args.UrpcServerFileIndex].Fd())
+	sockfd, err := unix.Dup(ctrlFileFD)
+	if err != nil {
+		return fmt.Errorf("duping control server socket: %w", err)
+	}
+
+	if l.ctrl, err = newController(sockfd, l); err != nil {
+		return fmt.Errorf("creating controller: %w", err)
+	}
+
+	fdbased.ReseedFallbackFanoutID()
+
+	devOSF := files[args.DeviceFileIndex]
+	devFD, err := fd.NewFromFile(devOSF)
+	if err != nil {
+		return fmt.Errorf("wrapping device fd: %w", err)
+	}
+	devOSF.Close()
+	files[args.DeviceFileIndex] = nil
+	if err := l.k.Platform.Reload(devFD); err != nil {
+		return fmt.Errorf("reloading platform: %w", err)
+	}
+
+	// Resume calibration after the template may have been idle.
+	l.k.Timekeeper().Reset("Sandbox Clone.")
+	l.k.Timekeeper().Resume(l.k.VDSOParamPage())
+
+	// Refresh SO_PEERCRED with this child instead of the socket creator.
+	if err := unix.Listen(l.ctrl.srv.FD(), 16 /* unet.backlog */); err != nil {
+		return fmt.Errorf("listening on forked control socket: %w", err)
+	}
+	l.ctrl.srv.StartServing()
 	return nil
 }

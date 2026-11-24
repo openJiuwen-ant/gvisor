@@ -17,6 +17,7 @@ package kvm
 
 import (
 	"fmt"
+	"os"
 
 	"golang.org/x/sys/unix"
 
@@ -83,7 +84,7 @@ func OpenDevice(devicePath string) (*fd.FD, error) {
 	if devicePath == "" {
 		devicePath = "/dev/kvm"
 	}
-	f, err := fd.Open(devicePath, unix.O_RDWR, 0)
+	f, err := fd.Open(devicePath, unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("error opening KVM device file (%s): %v", devicePath, err)
 	}
@@ -159,6 +160,55 @@ func (*KVM) MapUnit() uint64 {
 	// even though can get out of hand if you're creating multi-terabyte
 	// mappings. For this reason, we limit mappings to an arbitrary 16MB.
 	return 16 << 20
+}
+
+// Drop releases reloadable KVM-resident state while keeping the KVM object and
+// process-resident machine metadata reusable. In particular, Drop preserves
+// machine page tables, including executable mappings installed during initial
+// machine creation; Reload depends on these mappings remaining valid.
+func (k *KVM) Drop() {
+	if k.machine.procfs == nil {
+		// Retain the procfs root even when /proc/self is a symlink in the
+		// minimal chroot. Opening maps now would bind it to the parent's mm.
+		procfs, err := os.Open("/proc/self/..")
+		if err != nil {
+			panic(fmt.Sprintf("opening procfs for KVM reload: %v", err))
+		}
+		k.machine.procfs = procfs
+	}
+
+	k.machine.drop()
+}
+
+// Reload implements platform.Platform.Reload.
+func (k *KVM) Reload(devFile *fd.FD) error {
+	if devFile == nil {
+		return fmt.Errorf("KVM reload requires a device fd")
+	}
+	defer devFile.Close()
+
+	if k.machine.fd >= 0 {
+		return fmt.Errorf("KVM reload requires a dropped VM")
+	}
+
+	var vm uintptr
+	for {
+		var errno unix.Errno
+		vm, _, errno = unix.Syscall(unix.SYS_IOCTL, uintptr(devFile.FD()), KVM_CREATE_VM, 0)
+		if errno == unix.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return fmt.Errorf("creating KVM VM: %w", errno)
+		}
+		break
+	}
+
+	if err := k.machine.reload(int(vm)); err != nil {
+		k.machine.drop()
+		return fmt.Errorf("reloading KVM VM: %w", err)
+	}
+	return nil
 }
 
 // MinUserAddress returns the lowest available address.

@@ -163,29 +163,9 @@ func precompiledPrograms(parallelism int) ([]precompiledseccomp.Program, error) 
 	for i, opt := range opts {
 		i, opt := i, opt
 		errGroup.Go(func() error {
-			var varNames []string
-			for varName := range opt.Vars() {
-				varNames = append(varNames, varName)
-			}
-			program, err := precompiledseccomp.Precompile(opt.ConfigKey(), varNames, func(vars precompiledseccomp.Values) *seccomp.Program {
-				opt := opt
-				seccompOpts := SeccompOptions(opt)
-				rules, denyRules := rules(opt, vars)
-				return &seccomp.Program{
-					RuleSets: []seccomp.RuleSet{
-						{
-							Rules: denyRules.Copy(),
-						},
-						{
-							Rules:  rules.Copy(),
-							Action: seccomp.Allow,
-						},
-					},
-					Options: seccompOpts,
-				}
-			})
+			program, err := Precompile(opt)
 			if err != nil {
-				return fmt.Errorf("cannot precompile seccomp program for options %v: %w", opt.ConfigKey(), err)
+				return err
 			}
 			programsMu.Lock()
 			defer programsMu.Unlock()
@@ -197,4 +177,28 @@ func precompiledPrograms(parallelism int) ([]precompiledseccomp.Program, error) 
 		return nil, err
 	}
 	return programs, nil
+}
+
+// Precompile prepares the seccomp program for a single configuration.
+func Precompile(opt Options) (precompiledseccomp.Program, error) {
+	var varNames []string
+	for varName := range opt.Vars() {
+		varNames = append(varNames, varName)
+	}
+	return precompiledseccomp.Precompile(opt.ConfigKey(), varNames, func(vars precompiledseccomp.Values) *seccomp.Program {
+		seccompOpts := SeccompOptions(opt)
+		rules, denyRules := rules(opt, vars)
+		return &seccomp.Program{
+			RuleSets: []seccomp.RuleSet{
+				{
+					Rules: denyRules.Copy(),
+				},
+				{
+					Rules:  rules.Copy(),
+					Action: seccomp.Allow,
+				},
+			},
+			Options: seccompOpts,
+		}
+	})
 }

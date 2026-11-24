@@ -18,6 +18,7 @@ go_library(
         "restore.go",
         "seccomp.go",
         "specutils.go",
+        "stdio.go",
     ],
     importpath = "gvisor.dev/gvisor/runsc/specutils",
     visibility = ["//:sandbox"],

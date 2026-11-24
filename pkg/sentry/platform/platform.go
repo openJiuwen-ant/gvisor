@@ -119,6 +119,20 @@ type Platform interface {
 
 	// NumCPUs returns the number of CPUs on the platform.
 	NumCPUs() int
+
+	// Drop releases platform-resident resources while preserving the metadata
+	// needed by Reload. Unsupported platforms may panic.
+	//
+	// Preconditions: all execution contexts are stopped.
+	Drop()
+
+	// Reload rebuilds platform-resident resources after Drop.
+	// It takes ownership of devFile, including on failure. Unsupported platforms
+	// may panic.
+	//
+	// Preconditions: Drop has completed and all execution contexts are stopped.
+	// Execution must remain stopped until Reload succeeds.
+	Reload(devFile *fd.FD) error
 }
 
 // NoCPUPreemptionDetection implements Platform.DetectsCPUPreemption and

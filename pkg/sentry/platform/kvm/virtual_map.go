@@ -71,8 +71,11 @@ func applyVirtualRegions(fn func(vr virtualRegion) bool) error {
 	}
 	defer f.Close()
 
-	// Parse all entries.
-	r := bufio.NewReader(f)
+	return parseVirtualRegions(f, fn)
+}
+
+func parseVirtualRegions(maps io.Reader, fn func(vr virtualRegion) bool) error {
+	r := bufio.NewReader(maps)
 	for {
 		b, err := r.ReadBytes('\n')
 		if len(b) > 0 {

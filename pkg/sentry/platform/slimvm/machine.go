@@ -307,28 +307,26 @@ func (m *machine) mapPhysical(physical, length uintptr) {
 // Precondition: all vCPUs must be returned to the machine.
 func (m *machine) Destroy() {
 	runtime.SetFinalizer(m, nil)
+	m.drop()
+}
 
-	// Disable VMCALL forwarding before bouncing. A vCPU parked in guest
-	// mode inside a VMCALL-forwarded blocking syscall (e.g. a Go runtime
-	// futex) cannot be bounced out: the bounce signal only interrupts the
-	// forwarded syscall, which is retried via VMCALL and re-parks, so
-	// BounceToHost would spin forever. Disabling VMCALL forces the retry
-	// down the HLT path, yielding a real VM exit back to host.
+// drop releases resident state after all execution contexts have stopped.
+func (m *machine) drop() {
+	// Disable forwarding before bouncing so a blocked VMCALL can exit.
 	for _, c := range m.vCPUs {
 		c.CPU.DisableVMCALL()
 	}
-
-	// Destroy vCPUs.
 	for _, c := range m.vCPUs {
-		// Ensure the vCPU is not still running in guest mode. This is
-		// possible iff teardown has been done by other threads, and
-		// somehow a single thread has not executed any system calls.
 		c.BounceToHost()
 	}
-
-	// vCPUs are gone: teardown machine state.
-	if err := slimvmFile.Close(); err != nil {
-		panic(fmt.Sprintf("error closing VM fd: %v", err))
+	m.vCPUs = make(map[uint64]*vCPU)
+	m.allocatedVCPUIDs = bitmap.New(_SLIMVM_NR_VCPUS)
+	if slimvmFile != nil {
+		if err := slimvmFile.Close(); err != nil {
+			panic(fmt.Sprintf("error closing VM fd: %v", err))
+		}
+		slimvmFile = nil
+		slimvmFD = 0
 	}
 }
 
@@ -355,18 +353,19 @@ func (m *machine) Get() *vCPU {
 
 	runtime.UnlockOSThread()
 	m.mu.Lock()
-	runtime.LockOSThread()
-	tid = hosttid.Current()
-
-	// Check for an exact match again, as we may have switched to another
-	// thread now.
-	if c := m.vCPUs[tid]; c != nil {
-		c.lock()
-		m.mu.Unlock()
-		return c
-	}
 
 	for {
+		runtime.LockOSThread()
+		tid = hosttid.Current()
+
+		// Recheck after acquiring mu or waiting for an available vCPU,
+		// since either may move us to another thread.
+		if c := m.vCPUs[tid]; c != nil {
+			c.lock()
+			m.mu.Unlock()
+			return c
+		}
+
 		// Create a new vCPU (lazily) until we reach the limit.
 		if c := m.newVCPU(); c != nil {
 			c.lock()
@@ -388,7 +387,32 @@ func (m *machine) Get() *vCPU {
 			}
 		}
 
-		// Nothing available; wait for a Put to signal.
+		// A returned vCPU may still be running Sentry code in guest
+		// mode, including a blocking VMCALL-forwarded host syscall.
+		// Force it to host mode before rebinding it. Holding mu prevents
+		// its thread from reacquiring it during this transition.
+		for origTID, c := range m.vCPUs {
+			if !c.state.CompareAndSwap(vCPUGuest, vCPUGuest|vCPUWaiter) {
+				continue
+			}
+			c.CPU.DisableVMCALL()
+			c.sendSignal()
+			for !c.state.CompareAndSwap(vCPUReady, vCPUUser) {
+				if c.waitUntilNot(vCPUGuest | vCPUWaiter) {
+					c.sendSignal()
+				}
+			}
+			c.CPU.EnableVMCALL()
+			delete(m.vCPUs, origTID)
+			m.vCPUs[tid] = c
+			m.mu.Unlock()
+			c.loadSegments(tid)
+			return c
+		}
+
+		// All vCPUs are acquired. Release the OS thread while waiting
+		// so the runtime can reuse it for another goroutine.
+		runtime.UnlockOSThread()
 		m.available.Wait()
 	}
 }
